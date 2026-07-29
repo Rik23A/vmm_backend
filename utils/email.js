@@ -348,7 +348,7 @@ const sendEmail = async ({ to, templateName, templateData, emailConfig = {}, rep
             emailFrom: tenant.emailConfig.emailFrom,
             emailSecure: tenant.emailConfig.emailSecure,
           };
-          console.log(`[Email] Using custom SMTP config for tenant: ${resolvedTenantId}`);
+          console.log(`[Email] Using custom SMTP config for tenant: ${resolvedTenantId} (host: ${resolvedEmailConfig.emailHost}, port: ${resolvedEmailConfig.emailPort}, user: ${resolvedEmailConfig.emailUser}, passLength: ${resolvedEmailConfig.emailPass ? resolvedEmailConfig.emailPass.length : 0})`);
         }
       } catch (dbErr) {
         console.error(`[Email Config Lookup Error] Failed to fetch tenant email config for ${resolvedTenantId}:`, dbErr.message);
@@ -359,6 +359,7 @@ const sendEmail = async ({ to, templateName, templateData, emailConfig = {}, rep
     const from = resolvedEmailConfig.emailFrom || process.env.EMAIL_FROM || 'VMM System <noreply@vmm.app>';
 
     const transporter = createTransporter(resolvedEmailConfig);
+    console.log(`[Email Debug] Connecting to ${resolvedEmailConfig.emailHost || process.env.EMAIL_HOST}:${resolvedEmailConfig.emailPort || process.env.EMAIL_PORT} (secure: ${transporter.options.secure})...`);
     const mailOptions = { from, to, subject, html };
     if (replyTo) {
       mailOptions.replyTo = replyTo;
