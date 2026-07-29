@@ -75,17 +75,24 @@ app.use('/api/admin',           require('./routes/admin'));
 app.use('/api/reports',         require('./routes/reports'));
 app.use('/api/notifications',   require('./routes/notifications'));
 
+// ── Trust Reverse Proxy (Render / Heroku / AWS ALB) ─────────────────
+app.set('trust proxy', 1);
+
 // ── Serve React Frontend (Production) ────────────────────────────────
-// After running `npm run build` in /client, the /dist folder is served here
+// If client dist exists on the server, serve it; otherwise backend acts purely as API server
 if (process.env.NODE_ENV === 'production') {
+  const fs = require('fs');
   const distPath = path.join(__dirname, '..', 'client', 'dist');
-  app.use(express.static(distPath));
-  // All non-API routes return the React app (client-side routing)
-  app.get('*', (req, res) => {
-    if (!req.path.startsWith('/api') && !req.path.startsWith('/uploads')) {
-      res.sendFile(path.join(distPath, 'index.html'));
-    }
-  });
+  if (fs.existsSync(distPath)) {
+    app.use(express.static(distPath));
+    app.get('*', (req, res, next) => {
+      if (!req.path.startsWith('/api') && !req.path.startsWith('/uploads')) {
+        res.sendFile(path.join(distPath, 'index.html'));
+      } else {
+        next();
+      }
+    });
+  }
 }
 
 // ── Global Error Handler ─────────────────────────────────────────────
