@@ -1,0 +1,43 @@
+# Dependency directories
+node_modules/
+
+# Environment variables (contains sensitive credentials)
+.env
+.env.local
+.env.*.local
+.env.backup
+.env.production
+
+# Uploads directory (keep the directory but ignore content, except .gitkeep)
+uploads/*
+!uploads/.gitkeep
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor/IDE configs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Documents and images (prevent uploading media/docs to git)
+*.zip
+*.pdf
+*.docx
+*.jpeg
+*.png
+*.jpg
+*.txt

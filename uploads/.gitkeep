@@ -1,0 +1,4 @@
+# This folder stores all vendor documents uploaded by users.
+# Structure: uploads/{tenantId}/{uuid}.{ext}
+# This file keeps the uploads directory tracked by git.
+# The .gitignore excludes actual uploaded files.
