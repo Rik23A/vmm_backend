@@ -20,10 +20,12 @@ const createTransporter = (emailConfig = {}) => {
     secure = process.env.EMAIL_SECURE === 'true';
   }
 
-  // If host is Gmail, use Nodemailer's built-in service preset
+  // If host is Gmail, explicitly set secure and port
   if (host && host.includes('gmail.com')) {
     return nodemailer.createTransport({
-      service: 'gmail',
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
       auth: { user, pass },
       connectionTimeout: 15000,
       greetingTimeout: 15000,
