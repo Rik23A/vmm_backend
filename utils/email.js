@@ -10,10 +10,10 @@ const createTransporter = (emailConfig = {}) => {
   // Port 465 requires secure: true (Implicit TLS/SSL)
   // Port 587 / 25 / 2525 require secure: false (Explicit STARTTLS)
   let secure;
-  if (typeof emailConfig.emailSecure === 'boolean') {
-    secure = emailConfig.emailSecure;
-  } else if (port === 465) {
+  if (port === 465) {
     secure = true;
+  } else if (typeof emailConfig.emailSecure === 'boolean') {
+    secure = emailConfig.emailSecure;
   } else if (port === 587 || port === 25 || port === 2525) {
     secure = false;
   } else {
