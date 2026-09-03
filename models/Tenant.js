@@ -37,7 +37,8 @@ const TenantSchema = new mongoose.Schema({
     sapSystemId: { type: String, default: '' },
     sapUser: { type: String, default: '' },
     sapPassword: { type: String, default: '', select: false }, // never returned in queries
-    sapOdataUrl: { type: String, default: '' }, // for S4HANA
+    sapOdataUrl: { type: String, default: '' }, // for S4HANA API_BUSINESS_PARTNER
+    sapIndiaTaxOdataUrl: { type: String, default: '' }, // for ZBP_INDIA_SP_SRV
     companyCodes: [{ type: String }],
     purchasingOrgs: [{ type: String }],
     sapBpGrouping: { type: String, default: 'Z001' },

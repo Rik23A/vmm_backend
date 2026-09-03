@@ -97,9 +97,12 @@ const VendorChangeRequestSchema = new mongoose.Schema({
     taxDetails: {
       gstin: { type: String, trim: true, uppercase: true },
       pan: { type: String, trim: true, uppercase: true },
-      msmeStatus: { type: String, enum: ['NONE', 'MICRO', 'SMALL', 'MEDIUM'], default: 'NONE' },
+      msmeStatus: { type: String, enum: ['NONE', 'MICRO', 'SMALL', 'MEDIUM', 'CANCELLED'], default: 'NONE' },
       msmeNumber: { type: String, trim: true },
-      msmeRegDate: { type: Date, default: null }
+      msmeRegDate: { type: Date, default: null },
+      msmeValTo: { type: Date, default: null },
+      msmeEntryDate: { type: Date, default: null },
+      msmeRegion: { type: String, trim: true }
     },
     addressDetails: {
       street: { type: String, trim: true },

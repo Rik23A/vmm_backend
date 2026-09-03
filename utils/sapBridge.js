@@ -29,6 +29,7 @@
 
 const axios = require('axios');
 const https = require('https');
+const sapIndiaTaxBridge = require('./sapIndiaTaxBridge');
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const CSRF_TTL_MS = 25 * 60 * 1000; // 25 min (SAP token lifetime = 30 min)
@@ -472,14 +473,15 @@ const _buildBPPayload = (vendorData, cfg) => {
       }],
     },
 
-    // ── A_BusinessPartnerTax (deep-insert) — GSTIN, MSME & TIN ──
+    // ── A_BusinessPartnerTax (deep-insert) — GSTIN & TIN ──
     to_BusinessPartnerTax: {
       results: [
         taxDetails?.gstin ? { BPTaxType: taxTypeGst, BPTaxNumber: taxDetails.gstin } : null,
-        taxDetails?.msmeNumber ? { BPTaxType: 'IN4', BPTaxNumber: taxDetails.msmeNumber } : null,
         taxDetails?.tin ? { BPTaxType: 'IN0', BPTaxNumber: taxDetails.tin } : null,
       ].filter(Boolean),
     },
+
+
 
     // ── A_BusinessPartnerBank (deep-insert) ──────────────────────────────
     // ⚠️  Correct field names: BankNumber (IFSC/routing), BankAccount (account no.)
@@ -491,6 +493,7 @@ const _buildBPPayload = (vendorData, cfg) => {
         BankAccount:            b.accountNumber || '',
         BankAccountHolderName:  b.accountHolder || '',
         BankControlKey:         b.controlKey    || 'EN',
+        BankAccountReferenceText: b.ifsc         || '',
       })),
     },
   };
@@ -537,46 +540,35 @@ const _buildSupplierCompanyPayload = (bpNumber, companyCodeData, taxDetails) => 
     IsToBeCheckedForDuplicates: true,
   };
 
-  if (taxDetails?.msmeStatus && taxDetails.msmeStatus !== 'NONE') {
-    payload.MinorityGroup = taxDetails.msmeStatus;
-  }
-  if (taxDetails?.msmeRegDate) {
-    payload.SupplierCertificationDate = _toSapODataDate(taxDetails.msmeRegDate);
-  }
+
 
   const wtList = companyCodeData.withholdingTax || [];
   if (wtList.length === 0 && companyCodeData.withholdingTaxType) {
     // Legacy single-field fallback — warn so this is visible in logs
     console.warn(`⚠️  [sapBridge] withholdingTax array was empty; falling back to auto-generate AP+NP from withholdingTaxType gate. Pass withholdingTax[] explicitly to avoid this.`);
     const taxCode = companyCodeData.withholdingTaxCode || '';
-    const { start: fyStart, end: fyEnd } = _getIndianFYRange();
     const types = ['AP', 'NP'];
     types.forEach(t => {
       wtList.push({
         taxType: t,
-        taxCode: '',
+        taxCode: taxCode || t,
         subject: true,
         recipientType: 'OT',
-        exemptionNumber: taxCode,
-        exemptionPercent: taxCode ? 100 : 0,
-        exemptFrom: fyStart,
-        exemptTo: fyEnd,
       });
     });
   }
 
   if (wtList.length > 0) {
     // ⚠️  Nav property is to_SupplierWithHoldingTax (NOT to_WithHoldingTax which belongs to A_CustomerCompany)
+    // Note: TAN exemption certificate details (WT_EXNR, rate, validity) are posted exclusively via
+    // custom OData ZBP_INDIA_SP_SRV (Step 5 / ToTanExemption). Passing them here causes SAP standard
+    // plausibility check error "LFBW-WT_EXNR: Plausibility check failed".
     payload.to_SupplierWithHoldingTax = {
       results: wtList.map(w => ({
         WithholdingTaxType:         w.taxType,
         WithholdingTaxCode:         w.taxCode        || '',   // "WTax Code" column in SAP BP transaction
         IsWithholdingTaxSubject:    w.subject !== undefined ? !!w.subject : true,
         RecipientType:              w.recipientType  || 'OT',
-        WithholdingTaxCertificate:  w.exemptionNumber || '',
-        WithholdingTaxExmptPercent: Number(w.exemptionPercent || 0).toFixed(2), // Edm.Decimal requires string representation (e.g., "100.00")
-        ExemptionDateBegin:         w.exemptFrom ? _toSapODataDate(w.exemptFrom) : null,
-        ExemptionDateEnd:           w.exemptTo   ? _toSapODataDate(w.exemptTo)   : null,
       })),
     };
   }
@@ -615,111 +607,249 @@ const _buildSupplierPurchOrgPayload = (bpNumber, purchasingData, cfg) => {
 };
 
 /**
- * pushToS4HANA — executes the multi-step vendor creation in SAP S/4HANA.
+ * pushToS4HANA — executes the resilient multi-step vendor creation in SAP S/4HANA:
  *
- * Step 1: POST A_BusinessPartner  (with deep-insert: Address, TaxNumber, Bank)
- * Step 1b: POST A_BusinessPartnerRole (separately for FI and Purchasing roles for maximum compatibility)
- * Step 2: GET verification check on CVI Supplier generation (checks direct A_Supplier key & to_Supplier mapping)
- * Step 3: POST A_SupplierCompany
- * Step 4: POST A_SupplierPurchasingOrg
+ * Step 1: POST A_BusinessPartner (with deep-insert: Address, TaxNumber, Bank) & MSME
+ * Step 2: POST A_BusinessPartnerRole (FI + Purchasing roles) & CVI Supplier generation
+ * Step 3: POST A_SupplierCompany (Company Code & Recon Account)
+ * Step 4: POST A_SupplierPurchasingOrg (Purchasing Org)
+ * Step 5: POST IndiaTaxGeneralSet (PAN, Service Reg, GST Class, TAN Exemptions via ZBP_INDIA_SP_SRV)
+ * Step 6: POST BPAttachmentSet (Document stream uploads via ZBP_INDIA_SP_SRV)
+ *
+ * Supports resumption: if options.existingBpNumber is provided or step is skipped,
+ * it bypasses already completed steps and executes only the remaining/failed steps.
  */
-const pushToS4HANA = async (vendorData, cfg) => {
+const pushToS4HANA = async (vendorData, cfg, options = {}) => {
   const { companyCodeData, purchasingData } = vendorData;
   const crypto = require('crypto');
   const txId = crypto.randomUUID().substring(0, 8).toUpperCase();
-  console.log(`\n🚀 [SAP S4HANA] [TX-${txId}] Starting vendor creation flow…`);
+  console.log(`\n🚀 [SAP S4HANA] [TX-${txId}] Starting multi-step vendor creation flow…`);
 
-  let bpNumber = null;
+  const reportStep = async (stepKey, status, data = {}) => {
+    if (typeof options.onStepProgress === 'function') {
+      try {
+        await options.onStepProgress(stepKey, status, data);
+      } catch (cbErr) {
+        console.warn(`⚠️ [SAP Bridge] onStepProgress callback failed for ${stepKey}:`, cbErr.message);
+      }
+    }
+  };
+
+  let bpNumber = options.existingBpNumber || vendorData.sapVendorNumber || vendorData.sapResult?.partialVendorNumber || null;
+  let supplierNumber = bpNumber;
+  let currentStepKey = 'step1_bp';
+  let bpPayload = null;
+  let bpRes = null;
+
   try {
-    // ── Step 1: Create Business Partner ──────────────────────────────────
-    const bpPayload = _buildBPPayload(vendorData, cfg);
-    console.log(`📦 [Step 1] [TX-${txId}] POST A_BusinessPartner payload:`, JSON.stringify(_maskSensitivePayload(bpPayload), null, 2));
-    const bpRes = await sapODataWrite(cfg, 'POST', '/A_BusinessPartner', bpPayload);
+    // ── Step 1: Create Business Partner (or use existing) ────────────────
+    currentStepKey = 'step1_bp';
+    if (bpNumber) {
+      console.log(`⏩ [Step 1] [TX-${txId}] Using existing BusinessPartner: ${bpNumber} (Skipping creation)`);
+      await reportStep('step1_bp', 'COMPLETED', { bpNumber });
+    } else {
+      await reportStep('step1_bp', 'IN_PROGRESS');
+      bpPayload = _buildBPPayload(vendorData, cfg);
+      console.log(`📦 [Step 1] [TX-${txId}] POST A_BusinessPartner payload:`, JSON.stringify(_maskSensitivePayload(bpPayload), null, 2));
+      bpRes = await sapODataWrite(cfg, 'POST', '/A_BusinessPartner', bpPayload);
 
-    // Read warning headers if returned by SAP Gateway
-    const sapWarning = bpRes.headers?.['sap-message'] || bpRes.headers?.['SAP-Message'];
-    if (sapWarning) {
-      console.warn(`⚠️  [SAP Gateway Warning] [TX-${txId}]:`, sapWarning);
-    }
+      const sapWarning = bpRes.headers?.['sap-message'] || bpRes.headers?.['SAP-Message'];
+      if (sapWarning) {
+        console.warn(`⚠️  [SAP Gateway Warning] [TX-${txId}]:`, sapWarning);
+      }
 
-    bpNumber = bpRes.data?.d?.BusinessPartner || bpRes.data?.BusinessPartner;
-    if (!bpNumber) throw new Error('[SAP] Step 1 succeeded but no BusinessPartner number returned');
-    console.log(`✅ [Step 1] [TX-${txId}] BusinessPartner created: ${bpNumber}`);
+      bpNumber = bpRes.data?.d?.BusinessPartner || bpRes.data?.BusinessPartner;
+      if (!bpNumber) throw new Error('[SAP] Step 1 succeeded but no BusinessPartner number returned');
+      console.log(`✅ [Step 1] [TX-${txId}] BusinessPartner created: ${bpNumber}`);
+      await reportStep('step1_bp', 'COMPLETED', { bpNumber });
 
-    // ── Step 1b: Post FI Role (Trigger for Supplier CVI) ────────────────
-    const roleFI = cfg?.vendorRoleFI || 'FLVN00';
-    if (roleFI) {
-      console.log(`📦 [Step 1b] [TX-${txId}] Posting FI Role (${roleFI}) for BP: ${bpNumber}`);
-      try {
-        await sapODataWrite(cfg, 'POST', '/A_BusinessPartnerRole', {
-          BusinessPartner: bpNumber,
-          BusinessPartnerRole: roleFI,
-        });
-        console.log(`✅ [Step 1b] [TX-${txId}] FI Role ${roleFI} assigned`);
-      } catch (err) {
-        if (_isRoleAlreadyAssigned(err)) {
-          console.warn(`⚠️  [Step 1b] [TX-${txId}] FI Role ${roleFI} is already assigned, skipping.`);
-        } else {
-          throw err;
+      // ── Step 1c: Post MSME BP Identification separately ────────────────
+      const taxDetails = vendorData.taxDetails;
+      if (taxDetails?.msmeNumber) {
+        const bpIdentType = {
+          'MICRO': 'MSME01',
+          'SMALL': 'MSME02',
+          'MEDIUM': 'MSME03',
+          'NONE': 'MSME04',
+          'NOT_AN_MSME': 'MSME04',
+          'CANCELLED': 'MSME05',
+          'MSME01': 'MSME01',
+          'MSME02': 'MSME02',
+          'MSME03': 'MSME03',
+          'MSME04': 'MSME04',
+          'MSME05': 'MSME05'
+        }[taxDetails.msmeStatus] || 'MSME02';
+
+        let entityName = 'A_BuPaIdentification';
+        try {
+          await sapODataRead(cfg, `/A_BuPaIdentification?$top=1&$format=json`);
+        } catch (e) {
+          entityName = 'A_BPIdentification';
+        }
+
+        console.log(`📦 [Step 1c] [TX-${txId}] Posting MSME BP Identification to /${entityName}`);
+        try {
+          await sapODataWrite(cfg, 'POST', `/${entityName}`, {
+            BusinessPartner: bpNumber,
+            BPIdentificationType: bpIdentType,
+            BPIdentificationNumber: taxDetails.msmeNumber.trim().toUpperCase(),
+            ValidityStartDate: _toSapODataDate(taxDetails.msmeRegDate),
+            ValidityEndDate: _toSapODataDate(taxDetails.msmeValTo),
+            BPIdentificationEntryDate: _toSapODataDate(taxDetails.msmeEntryDate),
+            Region: taxDetails.msmeRegion || '',
+            Country: 'IN'
+          });
+          console.log(`✅ [Step 1c] [TX-${txId}] MSME BP Identification assigned`);
+        } catch (err) {
+          console.error(`❌ [Step 1c] [TX-${txId}] Failed to assign MSME BP Identification: ${err.message}`);
         }
       }
     }
 
-    // ── Step 2: Verification of CVI Supplier generation (Poller helper) ──
-    // Polling is run after assigning the FI role, ensuring CVI has generated the Supplier ID before dependant roles are assigned.
-    const supplierNumber = await waitForSupplier(bpNumber, cfg, txId);
+    // ── Step 2: Roles & CVI Supplier Generation ──────────────────────────
+    currentStepKey = 'step2_roles_cvi';
+    if (options.skipSteps && options.skipSteps.includes('step2_roles_cvi')) {
+      console.log(`⏩ [Step 2] [TX-${txId}] Skipping Step 2 per options`);
+      await reportStep('step2_roles_cvi', 'SKIPPED');
+    } else {
+      await reportStep('step2_roles_cvi', 'IN_PROGRESS');
 
-    // ── Step 2b: Post Purchasing Role ────────────────────────────────────
-    const rolePurchasing = cfg?.vendorRolePurchasing || 'FLVN01';
-    if (rolePurchasing) {
-      console.log(`📦 [Step 2b] [TX-${txId}] Posting Purchasing Role (${rolePurchasing}) for BP: ${bpNumber}`);
-      try {
-        await sapODataWrite(cfg, 'POST', '/A_BusinessPartnerRole', {
-          BusinessPartner: bpNumber,
-          BusinessPartnerRole: rolePurchasing,
-        });
-        console.log(`✅ [Step 2b] [TX-${txId}] Purchasing Role ${rolePurchasing} assigned`);
-      } catch (err) {
-        if (_isRoleAlreadyAssigned(err)) {
-          console.warn(`⚠️  [Step 2b] [TX-${txId}] Purchasing Role ${rolePurchasing} is already assigned, skipping.`);
-        } else {
-          throw err;
+      // Post FI Role (Trigger for Supplier CVI)
+      const roleFI = cfg?.vendorRoleFI || 'FLVN00';
+      if (roleFI) {
+        console.log(`📦 [Step 2] [TX-${txId}] Posting FI Role (${roleFI}) for BP: ${bpNumber}`);
+        try {
+          await sapODataWrite(cfg, 'POST', '/A_BusinessPartnerRole', {
+            BusinessPartner: bpNumber,
+            BusinessPartnerRole: roleFI,
+          });
+          console.log(`✅ [Step 2] [TX-${txId}] FI Role ${roleFI} assigned`);
+        } catch (err) {
+          if (_isRoleAlreadyAssigned(err)) {
+            console.warn(`⚠️  [Step 2] [TX-${txId}] FI Role ${roleFI} is already assigned, skipping.`);
+          } else {
+            throw err;
+          }
         }
       }
+
+      // Verification of CVI Supplier generation (Poller helper)
+      supplierNumber = await waitForSupplier(bpNumber, cfg, txId);
+
+      // Post Purchasing Role
+      const rolePurchasing = cfg?.vendorRolePurchasing || 'FLVN01';
+      if (rolePurchasing) {
+        console.log(`📦 [Step 2b] [TX-${txId}] Posting Purchasing Role (${rolePurchasing}) for BP: ${bpNumber}`);
+        try {
+          await sapODataWrite(cfg, 'POST', '/A_BusinessPartnerRole', {
+            BusinessPartner: bpNumber,
+            BusinessPartnerRole: rolePurchasing,
+          });
+          console.log(`✅ [Step 2b] [TX-${txId}] Purchasing Role ${rolePurchasing} assigned`);
+        } catch (err) {
+          if (_isRoleAlreadyAssigned(err)) {
+            console.warn(`⚠️  [Step 2b] [TX-${txId}] Purchasing Role ${rolePurchasing} is already assigned, skipping.`);
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      await reportStep('step2_roles_cvi', 'COMPLETED', { supplierNumber });
     }
 
-    // ── Step 3: Company Code data (Sequential retry-aware posting) ───────
+    // ── Step 3: Company Code data ────────────────────────────────────────
+    currentStepKey = 'step3_companyCode';
     if (companyCodeData?.companyCode) {
-      const ccPayload = _buildSupplierCompanyPayload(supplierNumber, companyCodeData, vendorData.taxDetails);
-      console.log(`📦 [Step 3] [TX-${txId}] POST A_SupplierCompany:`, JSON.stringify(_maskSensitivePayload(ccPayload), null, 2));
-      await postSupplierChildWithRetry(cfg, '/A_SupplierCompany', ccPayload, txId, 'Step 3: Company Code');
+      if (options.skipSteps && options.skipSteps.includes('step3_companyCode')) {
+        console.log(`⏩ [Step 3] [TX-${txId}] Skipping Step 3 per options`);
+        await reportStep('step3_companyCode', 'SKIPPED');
+      } else {
+        await reportStep('step3_companyCode', 'IN_PROGRESS');
+        const ccPayload = _buildSupplierCompanyPayload(supplierNumber || bpNumber, companyCodeData, vendorData.taxDetails);
+        console.log(`📦 [Step 3] [TX-${txId}] POST A_SupplierCompany:`, JSON.stringify(_maskSensitivePayload(ccPayload), null, 2));
+        await postSupplierChildWithRetry(cfg, '/A_SupplierCompany', ccPayload, txId, 'Step 3: Company Code');
+        await reportStep('step3_companyCode', 'COMPLETED');
+      }
     } else {
       console.log(`⏭️  [Step 3] [TX-${txId}] Skipped — no companyCode provided`);
+      await reportStep('step3_companyCode', 'SKIPPED');
     }
 
-    // ── Step 4: Purchasing Org data (Sequential retry-aware posting) ─────
+    // ── Step 4: Purchasing Org data ──────────────────────────────────────
+    currentStepKey = 'step4_purchasingOrg';
     if (purchasingData?.purchasingOrg) {
-      const poPayload = _buildSupplierPurchOrgPayload(supplierNumber, purchasingData, cfg);
-      console.log(`📦 [Step 4] [TX-${txId}] POST A_SupplierPurchasingOrg:`, JSON.stringify(_maskSensitivePayload(poPayload), null, 2));
-      await postSupplierChildWithRetry(cfg, '/A_SupplierPurchasingOrg', poPayload, txId, 'Step 4: Purchasing Org');
+      if (options.skipSteps && options.skipSteps.includes('step4_purchasingOrg')) {
+        console.log(`⏩ [Step 4] [TX-${txId}] Skipping Step 4 per options`);
+        await reportStep('step4_purchasingOrg', 'SKIPPED');
+      } else {
+        await reportStep('step4_purchasingOrg', 'IN_PROGRESS');
+        const poPayload = _buildSupplierPurchOrgPayload(supplierNumber || bpNumber, purchasingData, cfg);
+        console.log(`📦 [Step 4] [TX-${txId}] POST A_SupplierPurchasingOrg:`, JSON.stringify(_maskSensitivePayload(poPayload), null, 2));
+        await postSupplierChildWithRetry(cfg, '/A_SupplierPurchasingOrg', poPayload, txId, 'Step 4: Purchasing Org');
+        await reportStep('step4_purchasingOrg', 'COMPLETED');
+      }
     } else {
       console.log(`⏭️  [Step 4] [TX-${txId}] Skipped — no purchasingOrg provided`);
+      await reportStep('step4_purchasingOrg', 'SKIPPED');
     }
 
-    console.log(`\n🎉 [SAP S4HANA] [TX-${txId}] Vendor fully created — SAP Supplier No: ${supplierNumber}\n`);
+    // ── Step 5: India Tax & TAN Details (ZBP_INDIA_SP_SRV) ───────────────
+    currentStepKey = 'step5_indiaTax';
+    if (vendorData.taxDetails) {
+      if (options.skipSteps && options.skipSteps.includes('step5_indiaTax')) {
+        console.log(`⏩ [Step 5] [TX-${txId}] Skipping Step 5 per options`);
+        await reportStep('step5_indiaTax', 'SKIPPED');
+      } else {
+        await reportStep('step5_indiaTax', 'IN_PROGRESS');
+        console.log(`📦 [Step 5] [TX-${txId}] Calling ZBP_INDIA_SP_SRV for BP: ${bpNumber}`);
+        await sapIndiaTaxBridge.postIndiaTaxDetails(cfg, bpNumber, vendorData);
+        await reportStep('step5_indiaTax', 'COMPLETED');
+      }
+    } else {
+      await reportStep('step5_indiaTax', 'SKIPPED');
+    }
+
+    // ── Step 6: Upload Attachments (ZBP_INDIA_SP_SRV BPAttachmentSet) ───
+    currentStepKey = 'step6_attachments';
+    if (Array.isArray(vendorData.documents) && vendorData.documents.length > 0) {
+      if (options.skipSteps && options.skipSteps.includes('step6_attachments')) {
+        console.log(`⏩ [Step 6] [TX-${txId}] Skipping Step 6 per options`);
+        await reportStep('step6_attachments', 'SKIPPED');
+      } else {
+        await reportStep('step6_attachments', 'IN_PROGRESS');
+        console.log(`📦 [Step 6] [TX-${txId}] Uploading ${vendorData.documents.length} attachments to SAP for BP: ${bpNumber}`);
+        for (const doc of vendorData.documents) {
+          try {
+            await sapIndiaTaxBridge.uploadIndiaTaxAttachment(cfg, bpNumber, doc);
+          } catch (attErr) {
+            console.warn(`⚠️ [Step 6] [TX-${txId}] Attachment upload failed for ${doc.fileName}: ${attErr.message}`);
+          }
+        }
+        await reportStep('step6_attachments', 'COMPLETED');
+      }
+    } else {
+      await reportStep('step6_attachments', 'SKIPPED');
+    }
+
+    console.log(`\n🎉 [SAP S4HANA] [TX-${txId}] Vendor creation workflow fully completed — SAP Supplier No: ${supplierNumber || bpNumber}\n`);
     return {
-      vendorNumber: supplierNumber,
+      vendorNumber: supplierNumber || bpNumber,
+      bpNumber: bpNumber,
       payload: bpPayload,
-      response: bpRes.data,
+      response: bpRes?.data,
     };
 
   } catch (err) {
-    console.error(`💥 [SAP S4HANA Error] [TX-${txId}] Creation workflow failed downstream: ${err.message}`);
+    console.error(`💥 [SAP S4HANA Error] [TX-${txId}] Step '${currentStepKey}' failed: ${err.message}`);
+    await reportStep(currentStepKey, 'FAILED', { error: err.message, bpNumber });
+
     if (bpNumber) {
-      console.error(`🚨 [ORPHAN ALERT] [TX-${txId}] Business Partner '${bpNumber}' was created successfully, but subsequent setup failed. Please review in SAP.`);
+      console.error(`🚨 [CHECKPOINT ALERT] [TX-${txId}] Business Partner '${bpNumber}' was preserved in SAP. Failed at step: ${currentStepKey}`);
       err.bpNumber = bpNumber;
       err.vendorNumber = bpNumber;
     }
+    err.failedStep = currentStepKey;
     throw err;
   }
 };
@@ -893,18 +1023,13 @@ const patchVendorInSAP = async (bpNumber, vendorData, addressId, cfg) => {
     if (wtList.length === 0 && companyCodeData.withholdingTaxType) {
       console.warn(`⚠️  [sapBridge PATCH] withholdingTax array empty; falling back to auto-generate AP+NP.`);
       const taxCode = companyCodeData.withholdingTaxCode || '';
-      const { start: fyStart, end: fyEnd } = _getIndianFYRange();
       const types = ['AP', 'NP'];
       types.forEach(t => {
         wtList.push({
           taxType: t,
-          taxCode: '',
+          taxCode: taxCode || t,
           subject: true,
           recipientType: 'OT',
-          exemptionNumber: taxCode,
-          exemptionPercent: taxCode ? 100 : 0,
-          exemptFrom: fyStart,
-          exemptTo: fyEnd,
         });
       });
     }
@@ -916,10 +1041,7 @@ const patchVendorInSAP = async (bpNumber, vendorData, addressId, cfg) => {
           await sapODataWrite(cfg, 'PATCH', `/A_SupplierWithHoldingTax(${wtKey})`, {
             WithholdingTaxCode:         w.taxCode        || '',
             IsWithholdingTaxSubject:    w.subject !== undefined ? !!w.subject : true,
-            WithholdingTaxCertificate:  w.exemptionNumber || '',
-            WithholdingTaxExmptPercent: Number(w.exemptionPercent || 0).toFixed(2), // Edm.Decimal requires string representation
-            ExemptionDateBegin:         w.exemptFrom ? _toSapODataDate(w.exemptFrom) : null,
-            ExemptionDateEnd:           w.exemptTo   ? _toSapODataDate(w.exemptTo)   : null,
+            RecipientType:              w.recipientType  || 'OT',
           });
           console.log(`✅ [PATCH] A_SupplierWithHoldingTax (${w.taxType}) updated`);
         } catch (err) {
@@ -932,10 +1054,6 @@ const patchVendorInSAP = async (bpNumber, vendorData, addressId, cfg) => {
               WithholdingTaxCode:         w.taxCode        || '',
               IsWithholdingTaxSubject:    w.subject !== undefined ? !!w.subject : true,
               RecipientType:              w.recipientType  || 'OT',
-              WithholdingTaxCertificate:  w.exemptionNumber || '',
-              WithholdingTaxExmptPercent: Number(w.exemptionPercent || 0).toFixed(2), // Edm.Decimal requires string representation
-              ExemptionDateBegin:         w.exemptFrom ? _toSapODataDate(w.exemptFrom) : null,
-              ExemptionDateEnd:           w.exemptTo   ? _toSapODataDate(w.exemptTo)   : null,
             });
             console.log(`✅ [POST] A_SupplierWithHoldingTax (${w.taxType}) created successfully`);
           } catch (postErr) {
@@ -1174,6 +1292,24 @@ const getVendorFromSAP = async (bpNumber, cfg) => {
   const bp = results[0] || null;
   if (!bp) return null;
 
+  // Retrieve BP Identification separately to avoid Resource Not Found issues on older Gateway CVI services
+  let bpIdentifications = [];
+  try {
+    const actualBpNum = bp.BusinessPartner || formattedBp;
+    const identRes = await sapODataRead(cfg, `/A_BuPaIdentification?$filter=BusinessPartner eq '${actualBpNum}'&$format=json`);
+    bpIdentifications = identRes.data?.d?.results || identRes.data?.results || [];
+  } catch (err) {
+    console.warn(`⚠️ [sapBridge] Failed to read A_BuPaIdentification separately, trying A_BPIdentification: ${err.message}`);
+    try {
+      const actualBpNum = bp.BusinessPartner || formattedBp;
+      const identRes = await sapODataRead(cfg, `/A_BPIdentification?$filter=BusinessPartner eq '${actualBpNum}'&$format=json`);
+      bpIdentifications = identRes.data?.d?.results || identRes.data?.results || [];
+    } catch (fallbackErr) {
+      console.warn(`⚠️ [sapBridge] Failed fallback to A_BPIdentification: ${fallbackErr.message}`);
+    }
+  }
+  bp.to_BPIdentification = { results: bpIdentifications };
+
   // Fetch Supplier sub-entities separately to avoid OData Gateway dump on missing associations
   let supplierObj = bp.to_Supplier;
   if (supplierObj && Array.isArray(supplierObj.results)) {
@@ -1224,12 +1360,38 @@ const getVendorFromSAP = async (bpNumber, cfg) => {
 //  SECTION F — STUB mode
 // ═══════════════════════════════════════════════════════════════════════════
 
-const pushStub = async (vendorData) => {
-  console.log('🧪 [SAP] STUB — no real SAP call');
-  await new Promise((r) => setTimeout(r, 600));
+const pushStub = async (vendorData, options = {}) => {
+  console.log('🧪 [SAP] STUB — simulated multi-step vendor creation');
+  const reportStep = async (stepKey, status, data = {}) => {
+    if (typeof options.onStepProgress === 'function') {
+      try { await options.onStepProgress(stepKey, status, data); } catch (_) {}
+    }
+  };
+
   const num = Math.floor(100_000 + Math.random() * 900_000);
+  const vendorNumber = options.existingBpNumber || `V${num}`;
+
+  // Simulate sequential step progression
+  await reportStep('step1_bp', 'COMPLETED', { bpNumber: vendorNumber });
+  await new Promise((r) => setTimeout(r, 100));
+
+  await reportStep('step2_roles_cvi', 'COMPLETED', { supplierNumber: vendorNumber });
+  await new Promise((r) => setTimeout(r, 100));
+
+  await reportStep('step3_companyCode', 'COMPLETED');
+  await new Promise((r) => setTimeout(r, 100));
+
+  await reportStep('step4_purchasingOrg', 'COMPLETED');
+  await new Promise((r) => setTimeout(r, 100));
+
+  await reportStep('step5_indiaTax', 'COMPLETED');
+  await new Promise((r) => setTimeout(r, 100));
+
+  await reportStep('step6_attachments', 'COMPLETED');
+
   return {
-    vendorNumber: `V${num}`,
+    vendorNumber,
+    bpNumber: vendorNumber,
     payload:  { info: 'STUB', vendorName: vendorData?.generalData?.vendorName },
     response: { status: 'SUCCESS_STUB' },
   };
@@ -1242,13 +1404,14 @@ const pushStub = async (vendorData) => {
 /**
  * pushVendor — main entry point called after final MDT approval.
  * Dispatches to STUB / ECC / S4HANA / S4HANA_BAPI based on sapConfig.sapVersion.
+ * Supports options: { existingBpNumber, onStepProgress, skipSteps }
  */
-const pushVendor = async (vendorData, sapConfig) => {
+const pushVendor = async (vendorData, sapConfig, options = {}) => {
   const mode = (sapConfig.sapVersion || 'STUB').toUpperCase();
   console.log(`\n📡 [SAP Bridge] Mode: ${mode} ${'─'.repeat(40)}`);
   switch (mode) {
-    case 'S4HANA':      return pushToS4HANA(vendorData, sapConfig);
-    case 'STUB':        return pushStub(vendorData);
+    case 'S4HANA':      return pushToS4HANA(vendorData, sapConfig, options);
+    case 'STUB':        return pushStub(vendorData, options);
     default: throw new Error(`[SAP Bridge] Unsupported mode: "${mode}" (valid: STUB | S4HANA)`);
   }
 };
@@ -1295,55 +1458,81 @@ const pushVendorChangeRequest = async (bpNumber, proposedChanges, cfg) => {
     }
   }
 
-  // 3. MSME Number (IN4) Update
+  // 3. MSME Number (BP Identification MSME01-MSME05) Update
   if (taxDetails?.msmeNumber) {
-    const taxKey = `BusinessPartner='${formattedBp}',BPTaxType='IN4'`;
+    const bpIdentType = {
+      'MICRO': 'MSME01',
+      'SMALL': 'MSME02',
+      'MEDIUM': 'MSME03',
+      'NONE': 'MSME04',
+      'NOT_AN_MSME': 'MSME04',
+      'CANCELLED': 'MSME05',
+      'MSME01': 'MSME01',
+      'MSME02': 'MSME02',
+      'MSME03': 'MSME03',
+      'MSME04': 'MSME04',
+      'MSME05': 'MSME05'
+    }[taxDetails.msmeStatus] || 'MSME02';
+
+    let entityName = 'A_BuPaIdentification';
     try {
-      await sapODataWrite(cfg, 'PATCH', `/A_BusinessPartnerTax(${taxKey})`, {
-        BPTaxNumber: taxDetails.msmeNumber,
-      });
-      console.log(`✅ [CR PATCH] MSME Number updated`);
-    } catch (err) {
-      console.warn(`[CR PATCH] MSME Number not found, attempting creation…`);
-      try {
-        await sapODataWrite(cfg, 'POST', '/A_BusinessPartnerTax', {
-          BusinessPartner: formattedBp,
-          BPTaxType: 'IN4',
-          BPTaxNumber: taxDetails.msmeNumber,
-        });
-        console.log(`✅ [CR POST] MSME Number created`);
-      } catch (postErr) {
-        console.error(`❌ [CR POST] Failed to write MSME Number: ${postErr.message}`);
+      await sapODataRead(cfg, `/A_BuPaIdentification?$top=1&$format=json`);
+    } catch (e) {
+      entityName = 'A_BPIdentification';
+    }
+
+    try {
+      const msmeRes = await sapODataRead(cfg, `/${entityName}?$filter=BusinessPartner eq '${formattedBp}' and (BPIdentificationType eq 'MSME01' or BPIdentificationType eq 'MSME02' or BPIdentificationType eq 'MSME03' or BPIdentificationType eq 'MSME04' or BPIdentificationType eq 'MSME05')&$format=json`);
+      const existingMsme = msmeRes.data?.d?.results || msmeRes.data?.results || [];
+      
+      const payload = {
+        BusinessPartner: formattedBp,
+        BPIdentificationType: bpIdentType,
+        BPIdentificationNumber: taxDetails.msmeNumber.trim().toUpperCase(),
+        ValidityStartDate: _toSapODataDate(taxDetails.msmeRegDate),
+        ValidityEndDate: _toSapODataDate(taxDetails.msmeValTo),
+        BPIdentificationEntryDate: _toSapODataDate(taxDetails.msmeEntryDate),
+        Region: taxDetails.msmeRegion || '',
+        Country: 'IN'
+      };
+
+      if (existingMsme.length > 0) {
+        const oldNo = existingMsme[0].BPIdentificationNumber;
+        const oldType = existingMsme[0].BPIdentificationType;
+        const oldValStart = existingMsme[0].ValidityStartDate ? new Date(existingMsme[0].ValidityStartDate).getTime() : 0;
+        const newValStart = taxDetails.msmeRegDate ? new Date(taxDetails.msmeRegDate).getTime() : 0;
+        
+        const oldValEnd = existingMsme[0].ValidityEndDate ? new Date(existingMsme[0].ValidityEndDate).getTime() : 0;
+        const newValEnd = taxDetails.msmeValTo ? new Date(taxDetails.msmeValTo).getTime() : 0;
+        
+        const oldEntry = existingMsme[0].BPIdentificationEntryDate ? new Date(existingMsme[0].BPIdentificationEntryDate).getTime() : 0;
+        const newEntry = taxDetails.msmeEntryDate ? new Date(taxDetails.msmeEntryDate).getTime() : 0;
+        
+        const oldReg = existingMsme[0].Region || '';
+        const newReg = taxDetails.msmeRegion || '';
+
+        if (oldNo !== taxDetails.msmeNumber || oldType !== bpIdentType || oldValStart !== newValStart || oldValEnd !== newValEnd || oldEntry !== newEntry || oldReg !== newReg) {
+          const deleteKey = `BusinessPartner='${formattedBp}',BPIdentificationType='${oldType}',BPIdentificationNumber='${oldNo}'`;
+          try {
+            await sapODataWrite(cfg, 'DELETE', `/${entityName}(${deleteKey})`);
+          } catch (delErr) {
+            console.error(`❌ [CR PATCH] Failed to delete old MSME Identification: ${delErr.message}`);
+          }
+          await sapODataWrite(cfg, 'POST', `/${entityName}`, payload);
+          console.log(`✅ [CR PATCH] MSME BP Identification updated (Re-created as ${bpIdentType})`);
+        } else {
+          console.log(`ℹ️ [CR PATCH] MSME BP Identification matches, no update needed`);
+        }
+      } else {
+        await sapODataWrite(cfg, 'POST', `/${entityName}`, payload);
+        console.log(`✅ [CR POST] MSME BP Identification created as ${bpIdentType}`);
       }
+    } catch (err) {
+      console.error(`❌ [CR PATCH] Failed to update MSME BP Identification: ${err.message}`);
     }
   }
 
-  // 4. MSME Status & Date Update (A_SupplierCompany)
-  if (taxDetails?.msmeStatus) {
-    const ccList = existingVendor.to_Supplier?.to_SupplierCompany?.results || 
-                   (existingVendor.to_Supplier?.to_SupplierCompany ? [existingVendor.to_Supplier.to_SupplierCompany] : []);
-    const companyCode = ccList[0]?.CompanyCode;
-    if (companyCode) {
-      const ccKey = `Supplier='${formattedBp}',CompanyCode='${companyCode}'`;
-      const ccPatch = {};
-      if (taxDetails.msmeStatus !== 'NONE') {
-        ccPatch.MinorityGroup = taxDetails.msmeStatus;
-      }
-      if (taxDetails.msmeRegDate) {
-        ccPatch.SupplierCertificationDate = _toSapODataDate(taxDetails.msmeRegDate);
-      }
-      if (Object.keys(ccPatch).length > 0) {
-        try {
-          await sapODataWrite(cfg, 'PATCH', `/A_SupplierCompany(${ccKey})`, ccPatch);
-          console.log(`✅ [CR PATCH] A_SupplierCompany (MSME status/date) updated`);
-        } catch (err) {
-          console.error(`❌ [CR PATCH] Failed to update MSME status/date in Company Code: ${err.message}`);
-        }
-      }
-    } else {
-      console.warn(`⚠️ [CR PATCH] No Company Code resolved for BP ${formattedBp}, skipping MSME Status/Date update`);
-    }
-  }
+
 
   // 5. Bank Details Update (A_BusinessPartnerBank)
   if (bankDetails && bankDetails.length > 0) {
@@ -1361,10 +1550,11 @@ const pushVendorChangeRequest = async (bpNumber, proposedChanges, cfg) => {
       
       const bankPayload = {
         BankCountryKey:        b.bankCountry || 'IN',
-        BankNumber:            b.bankKey || b.ifsc || '',
+        BankNumber:            b.bankKey || '',
         BankAccount:           b.accountNumber || '',
         BankAccountHolderName: b.accountHolder || '',
         BankControlKey:        b.controlKey || 'EN',
+        BankAccountReferenceText: b.ifsc || '',
       };
 
       if (matchedBank) {
@@ -1534,4 +1724,7 @@ module.exports = {
 
   // ── Payload builders (exposed for unit testing) ───────────────────────
   _buildBPPayload,
+
+  // ── India Tax Sub-Bridge ──────────────────────────────────────────────
+  sapIndiaTaxBridge,
 };

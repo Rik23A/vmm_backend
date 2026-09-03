@@ -43,6 +43,14 @@ router.get('/pending', requireLogin,
       const { search, page = 1, limit = 20 } = req.query;
       const query = { tenantId: req.tenantId };
 
+      if (req.user.role === 'L1_APPROVER') {
+        const otherL1s = await User.find({ role: 'L1_APPROVER', _id: { $ne: req.user._id } }).select('_id');
+        const otherL1Ids = otherL1s.map(u => u._id);
+        const otherL1Vendors = await User.find({ role: 'REQUESTOR', createdBy: { $in: otherL1Ids } }).select('_id');
+        const otherL1VendorIds = otherL1Vendors.map(u => u._id);
+        query.createdBy = { $nin: otherL1VendorIds };
+      }
+
       const andConditions = [];
 
       if (req.user.role === 'ADMIN') {
@@ -112,6 +120,16 @@ router.post('/:id/approve', requireLogin,
       if (req.user.role !== 'ADMIN' && req.user.plants && req.user.plants.length > 0) {
         if (vendor.plant && !req.user.plants.includes(vendor.plant)) {
           return res.status(403).json({ message: 'You are not authorized to perform actions on requests for this plant.' });
+        }
+      }
+
+      if (req.user.role === 'L1_APPROVER') {
+        const requesterUser = await User.findById(vendor.createdBy);
+        if (requesterUser && requesterUser.createdBy) {
+          const creatorUser = await User.findById(requesterUser.createdBy);
+          if (creatorUser && creatorUser.role === 'L1_APPROVER' && creatorUser._id.toString() !== req.user._id.toString()) {
+            return res.status(403).json({ message: 'You are not authorized to approve this request because it belongs to a vendor registered by another L1 Approver.' });
+          }
         }
       }
 
@@ -281,6 +299,16 @@ router.post('/:id/reject', requireLogin,
         }
       }
 
+      if (req.user.role === 'L1_APPROVER') {
+        const requesterUser = await User.findById(vendor.createdBy);
+        if (requesterUser && requesterUser.createdBy) {
+          const creatorUser = await User.findById(requesterUser.createdBy);
+          if (creatorUser && creatorUser.role === 'L1_APPROVER' && creatorUser._id.toString() !== req.user._id.toString()) {
+            return res.status(403).json({ message: 'You are not authorized to reject this request because it belongs to a vendor registered by another L1 Approver.' });
+          }
+        }
+      }
+
       const { comments } = req.body;
       if (!comments?.trim()) return res.status(400).json({ message: 'Rejection reason (comments) is required' });
 
@@ -323,6 +351,16 @@ router.post('/:id/sendback', requireLogin,
       if (req.user.role !== 'ADMIN' && req.user.plants && req.user.plants.length > 0) {
         if (vendor.plant && !req.user.plants.includes(vendor.plant)) {
           return res.status(403).json({ message: 'You are not authorized to perform actions on requests for this plant.' });
+        }
+      }
+
+      if (req.user.role === 'L1_APPROVER') {
+        const requesterUser = await User.findById(vendor.createdBy);
+        if (requesterUser && requesterUser.createdBy) {
+          const creatorUser = await User.findById(requesterUser.createdBy);
+          if (creatorUser && creatorUser.role === 'L1_APPROVER' && creatorUser._id.toString() !== req.user._id.toString()) {
+            return res.status(403).json({ message: 'You are not authorized to send back this request because it belongs to a vendor registered by another L1 Approver.' });
+          }
         }
       }
 
@@ -406,7 +444,7 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
       });
 
       try {
-        // ── Call SAP Bridge
+        // ── Call SAP Bridge with multi-step checkpointing
         let result;
         if (vendor.requestType === 'MODIFY') {
           result = await patchVendorInSAP(vendor.sapVendorNumber, vendor.toObject(), null, sapConfig);
@@ -414,7 +452,45 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
           result.payload = result.payload || vendor.toObject();
           result.response = result.response || { status: 'PATCHED' };
         } else {
-          result = await pushVendor(vendor.toObject(), sapConfig);
+          const existingBpNumber = vendor.sapVendorNumber || vendor.sapResult?.partialVendorNumber || null;
+
+          // Determine which steps were already completed previously
+          const skipSteps = [];
+          if (vendor.sapStepProgress) {
+            if (vendor.sapStepProgress.step1_bp?.status === 'COMPLETED' && existingBpNumber) skipSteps.push('step1_bp');
+            if (vendor.sapStepProgress.step2_roles_cvi?.status === 'COMPLETED') skipSteps.push('step2_roles_cvi');
+            if (vendor.sapStepProgress.step3_companyCode?.status === 'COMPLETED') skipSteps.push('step3_companyCode');
+            if (vendor.sapStepProgress.step4_purchasingOrg?.status === 'COMPLETED') skipSteps.push('step4_purchasingOrg');
+            if (vendor.sapStepProgress.step5_indiaTax?.status === 'COMPLETED') skipSteps.push('step5_indiaTax');
+            if (vendor.sapStepProgress.step6_attachments?.status === 'COMPLETED') skipSteps.push('step6_attachments');
+          }
+
+          const onStepProgress = async (stepKey, stepStatus, data = {}) => {
+            try {
+              const update = {
+                [`sapStepProgress.${stepKey}.status`]: stepStatus,
+                [`sapStepProgress.${stepKey}.completedAt`]: stepStatus === 'COMPLETED' ? new Date() : null,
+                [`sapStepProgress.${stepKey}.error`]: data.error || null,
+              };
+              if (data.bpNumber) {
+                update['sapStepProgress.step1_bp.bpNumber'] = data.bpNumber;
+                update['sapResult.partialVendorNumber'] = data.bpNumber;
+                update['sapVendorNumber'] = data.bpNumber;
+              }
+              if (data.supplierNumber) {
+                update['sapStepProgress.step2_roles_cvi.supplierNumber'] = data.supplierNumber;
+              }
+              await VendorRequest.findByIdAndUpdate(vendor._id, { $set: update });
+            } catch (err) {
+              console.warn(`[approvals onStepProgress] DB update error for ${stepKey}:`, err.message);
+            }
+          };
+
+          result = await pushVendor(vendor.toObject(), sapConfig, {
+            existingBpNumber,
+            skipSteps,
+            onStepProgress,
+          });
         }
 
         // ── SUCCESS: Store real SAP vendor number — this replaces the temp number for all future work
@@ -423,12 +499,15 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
         vendor.currentLevel = 'DONE';
         vendor.sapResult = {
           vendorNumber: result.vendorNumber,
+          partialVendorNumber: result.vendorNumber,
           pushedAt: new Date(),
           pushedBy: req.user._id,
           sapVersion: sapConfig.sapVersion,
           requestPayload: result.payload,
           responsePayload: result.response,
           errorMessage: null,
+          failedStep: null,
+          retryCount: vendor.sapResult?.retryCount || 0,
         };
         await vendor.save();
 
@@ -447,7 +526,7 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
           sapPayload: result.payload, sapResponse: result.response,
         });
 
-        // ── Notify requestor and MDT team for this vendor request only
+        // ── Notify requestor, L1 creator approver, and MDT team for this vendor request only
         const queryMdtUsers = {
           tenantId: req.tenantId, role: 'MASTER_DATA', isActive: true,
         };
@@ -455,11 +534,29 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
           queryMdtUsers.plants = vendor.plant;
         }
         const mdtUsers = await User.find(queryMdtUsers).select('email');
-        const requestor = vendor.createdBy ? await User.findById(vendor.createdBy).select('email') : null;
+        const requestor = vendor.createdBy ? await User.findById(vendor.createdBy) : null;
 
         const recipientEmails = new Set();
         mdtUsers.forEach(u => { if (u.email) recipientEmails.add(u.email); });
-        if (requestor && requestor.email) recipientEmails.add(requestor.email);
+        if (requestor && requestor.email) {
+          recipientEmails.add(requestor.email);
+          if (requestor.createdBy) {
+            const creatorUser = await User.findById(requestor.createdBy);
+            if (creatorUser && creatorUser.email && (creatorUser.role === 'L1_APPROVER' || creatorUser.role === 'ADMIN')) {
+              recipientEmails.add(creatorUser.email);
+            }
+          }
+        }
+        if (vendor.approvalChain && vendor.approvalChain.length > 0) {
+          for (const entry of vendor.approvalChain) {
+            if (entry.performedBy) {
+              const approverUser = await User.findById(entry.performedBy);
+              if (approverUser && approverUser.email && approverUser.role === 'L1_APPROVER') {
+                recipientEmails.add(approverUser.email);
+              }
+            }
+          }
+        }
 
         recipientEmails.forEach(email =>
           sendEmail({ to: email, templateName: 'SAP_PUSHED', templateData: { request: vendor }, replyTo: req.user.email })
@@ -476,6 +573,7 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
         // ── SAP FAILED: Record error, capture partial BP number if generated, allow manual link or retry
         vendor.status = 'SAP_FAILED';
         vendor.sapResult.errorMessage = sapError.message;
+        vendor.sapResult.failedStep = sapError.failedStep || null;
 
         // Catch BP / Vendor number from sapError object or error text if partially created in SAP
         const bpMatch = sapError.message && sapError.message.match(/\b(1\d{7,9}|2\d{7,9}|3\d{7,9}|10\d{5,7})\b/);
@@ -487,13 +585,18 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
           console.log(`📌 [SAP PUSH CATCH] Captured & attached SAP BP Number '${capturedBp}' to vendor record in VMM DB.`);
         }
 
+        if (sapError.failedStep && vendor.sapStepProgress && vendor.sapStepProgress[sapError.failedStep]) {
+          vendor.sapStepProgress[sapError.failedStep].status = 'FAILED';
+          vendor.sapStepProgress[sapError.failedStep].error = sapError.message;
+        }
+
         await vendor.save();
 
         await AuditLog.log({ tenantId: req.tenantId, requestId: vendor._id,
           tempVendorNumber: vendor.tempVendorNumber, action: 'SAP_PUSH_FAILED',
           performedBy: req.user._id, performedByName: req.user.fullName,
           comments: sapError.message,
-          sapPayload: { capturedBp: capturedBp || null }
+          sapPayload: { capturedBp: capturedBp || null, failedStep: sapError.failedStep || null }
         });
 
         const queryMdtUsers = { tenantId: req.tenantId, role: 'MASTER_DATA', isActive: true };
@@ -511,8 +614,10 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
         res.status(502).json({
           message: 'SAP push failed',
           error: sapError.message,
+          failedStep: sapError.failedStep || null,
           partialVendorNumber: capturedBp || null,
-          vendor
+          sapStepProgress: vendor.sapStepProgress,
+          vendor,
         });
       }
     } catch (err) { next(err); }
@@ -561,15 +666,33 @@ router.post('/:id/manual-sap-sync', requireLogin, requireRole('MASTER_DATA', 'AD
         comments: `Manually linked to SAP BP/Vendor number: ${cleanBpNumber}. ${comments}`,
       });
 
-      // Send SAP_PUSHED emails to MDT and requestor
+      // Send SAP_PUSHED emails to MDT, requestor, and L1 creator approver
       const queryMdtUsers = { tenantId: req.tenantId, role: 'MASTER_DATA', isActive: true };
       if (vendor.plant) queryMdtUsers.plants = vendor.plant;
       const mdtUsers = await User.find(queryMdtUsers).select('email');
-      const requestor = vendor.createdBy ? await User.findById(vendor.createdBy).select('email') : null;
+      const requestor = vendor.createdBy ? await User.findById(vendor.createdBy) : null;
 
       const recipientEmails = new Set();
       mdtUsers.forEach(u => { if (u.email) recipientEmails.add(u.email); });
-      if (requestor && requestor.email) recipientEmails.add(requestor.email);
+      if (requestor && requestor.email) {
+        recipientEmails.add(requestor.email);
+        if (requestor.createdBy) {
+          const creatorUser = await User.findById(requestor.createdBy);
+          if (creatorUser && creatorUser.email && (creatorUser.role === 'L1_APPROVER' || creatorUser.role === 'ADMIN')) {
+            recipientEmails.add(creatorUser.email);
+          }
+        }
+      }
+      if (vendor.approvalChain && vendor.approvalChain.length > 0) {
+        for (const entry of vendor.approvalChain) {
+          if (entry.performedBy) {
+            const approverUser = await User.findById(entry.performedBy);
+            if (approverUser && approverUser.email && approverUser.role === 'L1_APPROVER') {
+              recipientEmails.add(approverUser.email);
+            }
+          }
+        }
+      }
 
       recipientEmails.forEach(email =>
         sendEmail({ to: email, templateName: 'SAP_PUSHED', templateData: { request: vendor }, replyTo: req.user.email })

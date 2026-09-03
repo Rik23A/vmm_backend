@@ -13,7 +13,8 @@ const { sendEmail } = require('../utils/email');
 const User = require('../models/User');
 const Tenant = require('../models/Tenant');
 const { injectTenant, getSapConfig } = require('../middleware/tenant');
-const { fetchVendorsFromSAP, patchVendorInSAP, getVendorFromSAP } = require('../utils/sapBridge');
+const { fetchVendorsFromSAP, patchVendorInSAP, getVendorFromSAP, pushVendor } = require('../utils/sapBridge');
+const { getIndiaTaxDetails } = require('../utils/sapIndiaTaxBridge');
 
 // ── Multer: Store uploads in /uploads/{tenantId}/ ─────────────────────
 const storage = multer.diskStorage({
@@ -424,8 +425,6 @@ function mapSapToVmm(sapData) {
         taxDetails.tin = num;
       } else if (type === 'IN2') {
         taxDetails.cst = num;
-      } else if (type === 'IN4') {
-        taxDetails.msmeNumber = num;
       }
     });
 
@@ -435,12 +434,46 @@ function mapSapToVmm(sapData) {
     }
     taxDetails.allTaxNumbers = allTaxNumbers;
 
+    // Helper to parse SAP date strings
+    const parseSapDate = (sapDateStr) => {
+      if (!sapDateStr) return null;
+      if (typeof sapDateStr === 'string') {
+        const match = sapDateStr.match(/\/Date\((\d+)\)\//);
+        if (match) {
+          return new Date(parseInt(match[1], 10));
+        }
+      }
+      const parsed = new Date(sapDateStr);
+      return isNaN(parsed.getTime()) ? null : parsed;
+    };
+
+    // ── BP Identifications (MSME01-MSME05) ──────────────────────────────────
+    const idents = sapData.to_BPIdentification?.results || (Array.isArray(sapData.to_BPIdentification) ? sapData.to_BPIdentification : []);
+    const msmeIdent = idents.find(id => ['MSME01', 'MSME02', 'MSME03', 'MSME04', 'MSME05'].includes(id.BPIdentificationType));
+    if (msmeIdent) {
+      taxDetails.msmeNumber = msmeIdent.BPIdentificationNumber || '';
+      taxDetails.msmeRegDate = parseSapDate(msmeIdent.ValidityStartDate);
+      taxDetails.msmeValTo = parseSapDate(msmeIdent.ValidityEndDate);
+      taxDetails.msmeEntryDate = parseSapDate(msmeIdent.BPIdentificationEntryDate);
+      taxDetails.msmeRegion = msmeIdent.Region || '';
+      
+      const revMap = {
+        'MSME01': 'MICRO',
+        'MSME02': 'SMALL',
+        'MSME03': 'MEDIUM',
+        'MSME04': 'NONE',
+        'MSME05': 'CANCELLED'
+      };
+      taxDetails.msmeStatus = revMap[msmeIdent.BPIdentificationType] || 'NONE';
+    }
+
     // ── Bank Accounts ───────────────────────────────────────────────────────
     const banks = sapData.to_BusinessPartnerBank?.results || (Array.isArray(sapData.to_BusinessPartnerBank) ? sapData.to_BusinessPartnerBank : []);
     banks.forEach((b, idx) => {
       bankDetails.push({
         bankCountry:   b.BankCountryKey          || 'IN',
         bankKey:       b.BankNumber              || '',
+        ifsc:          b.BankAccountReferenceText || '',
         bankName:      b.BankName               || '',
         accountNumber: b.BankAccount             || '',
         accountHolder: b.BankAccountHolderName   || b.AccountHolderName || '',
@@ -477,7 +510,7 @@ function mapSapToVmm(sapData) {
           taxDetails.msmeStatus = ccObj.MinorityGroup;
         }
         if (ccObj.SupplierCertificationDate) {
-          taxDetails.msmeRegDate = ccObj.SupplierCertificationDate;
+          taxDetails.msmeRegDate = parseSapDate(ccObj.SupplierCertificationDate);
         }
 
         // Withholding tax entries (to_SupplierWithHoldingTax)
@@ -586,16 +619,76 @@ router.get('/sap/:sapVendorNumber', requireLogin, requireRole('REQUESTOR', 'L1_A
           taxDetails: {
             pan: sapVendorNumber === 'V100001' ? 'ABCDE1234F' : 'XYZWP5678Q',
             gstin: sapVendorNumber === 'V100001' ? '27ABCDE1234F1Z5' : '27XYZWP5678Q1Z6',
+            serviceRegNo: 'SRN999888',
+            cstNo: 'CST112233',
+            lstNo: 'LST445566',
+            gstVenClass: ' ',
             msmeStatus: 'NONE',
+            tanExemptions: [
+              {
+                companyCode: '1000',
+                sectionCode: '194C',
+                withholdingCode: 'AP',
+                withholdingTaxType: 'AP',
+                validFrom: new Date('2026-04-01'),
+                validTo: new Date('2027-03-31'),
+                exemptionNumber: 'CERT-2026-001',
+                exemptionRate: 1.5,
+                exemThreshold: 500000,
+                currency: 'INR',
+              }
+            ]
           }
         };
         return res.json({ vendor: stubData });
       }
 
-      const sapData = await getVendorFromSAP(sapVendorNumber, sapConfig);
+      const [sapDataResult, indiaTaxResult] = await Promise.allSettled([
+        getVendorFromSAP(sapVendorNumber, sapConfig),
+        getIndiaTaxDetails(sapConfig, sapVendorNumber)
+      ]);
+
+      const sapData = sapDataResult.status === 'fulfilled' ? sapDataResult.value : null;
       if (!sapData) return res.status(404).json({ message: 'Vendor not found in SAP' });
 
       const mapped = mapSapToVmm(sapData);
+
+      if (indiaTaxResult.status === 'fulfilled' && indiaTaxResult.value) {
+        const it = indiaTaxResult.value;
+        mapped.taxDetails = mapped.taxDetails || {};
+        if (it.PAN) mapped.taxDetails.pan = it.PAN;
+        mapped.taxDetails.serviceRegNo = it.ServiceRegNo || mapped.taxDetails.serviceRegNo || '';
+        mapped.taxDetails.cstNo = it.CSTNo || mapped.taxDetails.cstNo || '';
+        mapped.taxDetails.lstNo = it.LSTNo || mapped.taxDetails.lstNo || '';
+        mapped.taxDetails.gstVenClass = it.GstVenClass !== undefined && it.GstVenClass !== null ? String(it.GstVenClass) : (mapped.taxDetails.gstVenClass || ' ');
+        
+        const rawTans = it.ToTanExemption?.results || it.ToTanExemption || [];
+        if (Array.isArray(rawTans) && rawTans.length > 0) {
+          mapped.taxDetails.tanExemptions = rawTans.map(t => ({
+            companyCode: t.CompanyCode || '',
+            sectionCode: t.SectionCode || '',
+            withholdingCode: t.WithholdingCode || '',
+            withholdingTaxType: t.WithholdingTaxType || '',
+            validFrom: t.ValidFrom ? (typeof t.ValidFrom === 'string' && t.ValidFrom.includes('/Date(') ? new Date(parseInt(t.ValidFrom.replace(/\/Date\((\d+)\)\//, '$1'))) : t.ValidFrom) : null,
+            validTo: t.ValidTo ? (typeof t.ValidTo === 'string' && t.ValidTo.includes('/Date(') ? new Date(parseInt(t.ValidTo.replace(/\/Date\((\d+)\)\//, '$1'))) : t.ValidTo) : null,
+            exemptionNumber: t.ExemptionNumber || '',
+            exemptionRate: parseFloat(t.ExemptionRate) || 0,
+            exemThreshold: parseFloat(t.ExemThreshold) || 0,
+            currency: t.Currency || 'INR',
+          }));
+        }
+
+        const rawAtts = it.ToAttachments?.results || it.ToAttachments || [];
+        if (Array.isArray(rawAtts) && rawAtts.length > 0) {
+          mapped.taxDetails.sapAttachments = rawAtts.map(a => ({
+            attachmentId: a.AttachmentId,
+            fileName: a.FileName,
+            mimeType: a.MimeType,
+            createdOn: a.CreatedOn,
+          }));
+        }
+      }
+
       res.json({ vendor: mapped });
     } catch (err) { next(err); }
   }
@@ -1108,5 +1201,138 @@ router.post('/bulk-invite', requireLogin, requireRole('ADMIN', 'MASTER_DATA'), i
     res.json({ message: `Bulk invitation completed. Emails sent: ${sentCount}`, sentCount });
   } catch (err) { next(err); }
 });
+
+// ── PATCH /api/vendors/:id/fix-and-resume-sap ─────────────────────────
+// Updates specific failed fields (taxDetails, companyCodeData, purchasingData)
+// and resumes the SAP push from the failed step.
+router.patch('/:id/fix-and-resume-sap', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
+  injectTenant, async (req, res, next) => {
+    try {
+      const vendor = await VendorRequest.findOne({ _id: req.params.id, tenantId: req.tenantId });
+      if (!vendor) return res.status(404).json({ message: 'Vendor request not found' });
+
+      const { taxDetails, companyCodeData, purchasingData, generalData, triggerSync = true } = req.body;
+
+      if (taxDetails) {
+        vendor.taxDetails = { ...vendor.taxDetails?.toObject?.() || vendor.taxDetails, ...taxDetails };
+      }
+      if (companyCodeData) {
+        vendor.companyCodeData = { ...vendor.companyCodeData?.toObject?.() || vendor.companyCodeData, ...companyCodeData };
+      }
+      if (purchasingData) {
+        vendor.purchasingData = { ...vendor.purchasingData?.toObject?.() || vendor.purchasingData, ...purchasingData };
+      }
+      if (generalData) {
+        vendor.generalData = { ...vendor.generalData?.toObject?.() || vendor.generalData, ...generalData };
+      }
+
+      await vendor.save();
+
+      if (!triggerSync) {
+        return res.json({ message: 'Vendor fields updated', vendor });
+      }
+
+      const sapConfig = getSapConfig(req.tenant);
+      const existingBpNumber = vendor.sapVendorNumber || vendor.sapResult?.partialVendorNumber || null;
+
+      const skipSteps = [];
+      if (vendor.sapStepProgress) {
+        if (vendor.sapStepProgress.step1_bp?.status === 'COMPLETED' && existingBpNumber) skipSteps.push('step1_bp');
+        if (vendor.sapStepProgress.step2_roles_cvi?.status === 'COMPLETED') skipSteps.push('step2_roles_cvi');
+        if (vendor.sapStepProgress.step3_companyCode?.status === 'COMPLETED') skipSteps.push('step3_companyCode');
+        if (vendor.sapStepProgress.step4_purchasingOrg?.status === 'COMPLETED') skipSteps.push('step4_purchasingOrg');
+        if (vendor.sapStepProgress.step5_indiaTax?.status === 'COMPLETED') skipSteps.push('step5_indiaTax');
+        if (vendor.sapStepProgress.step6_attachments?.status === 'COMPLETED') skipSteps.push('step6_attachments');
+      }
+
+      const onStepProgress = async (stepKey, stepStatus, data = {}) => {
+        try {
+          const update = {
+            [`sapStepProgress.${stepKey}.status`]: stepStatus,
+            [`sapStepProgress.${stepKey}.completedAt`]: stepStatus === 'COMPLETED' ? new Date() : null,
+            [`sapStepProgress.${stepKey}.error`]: data.error || null,
+          };
+          if (data.bpNumber) {
+            update['sapStepProgress.step1_bp.bpNumber'] = data.bpNumber;
+            update['sapResult.partialVendorNumber'] = data.bpNumber;
+            update['sapVendorNumber'] = data.bpNumber;
+          }
+          if (data.supplierNumber) {
+            update['sapStepProgress.step2_roles_cvi.supplierNumber'] = data.supplierNumber;
+          }
+          await VendorRequest.findByIdAndUpdate(vendor._id, { $set: update });
+        } catch (err) {
+          console.warn(`[fix-and-resume onStepProgress] DB update error for ${stepKey}:`, err.message);
+        }
+      };
+
+      try {
+        const result = await pushVendor(vendor.toObject(), sapConfig, {
+          existingBpNumber,
+          skipSteps,
+          onStepProgress,
+        });
+
+        vendor.sapVendorNumber = result.vendorNumber;
+        vendor.status = 'SAP_PUSHED';
+        vendor.currentLevel = 'DONE';
+        vendor.sapResult = {
+          vendorNumber: result.vendorNumber,
+          partialVendorNumber: result.vendorNumber,
+          pushedAt: new Date(),
+          pushedBy: req.user._id,
+          sapVersion: sapConfig.sapVersion,
+          requestPayload: result.payload,
+          responsePayload: result.response,
+          errorMessage: null,
+          failedStep: null,
+          retryCount: (vendor.sapResult?.retryCount || 0) + 1,
+        };
+        await vendor.save();
+
+        await AuditLog.log({
+          tenantId: req.tenantId,
+          requestId: vendor._id,
+          tempVendorNumber: vendor.tempVendorNumber,
+          sapVendorNumber: result.vendorNumber,
+          action: 'SAP_PUSH_SUCCESS',
+          performedBy: req.user._id,
+          performedByName: req.user.fullName,
+          comments: 'Resumed and completed SAP sync after parameter correction',
+          sapPayload: result.payload,
+          sapResponse: result.response,
+        });
+
+        return res.json({
+          message: 'Vendor sync resumed and completed successfully in SAP',
+          sapVendorNumber: result.vendorNumber,
+          vendor,
+        });
+
+      } catch (sapError) {
+        vendor.status = 'SAP_FAILED';
+        vendor.sapResult.errorMessage = sapError.message;
+        vendor.sapResult.failedStep = sapError.failedStep || null;
+        vendor.sapResult.retryCount = (vendor.sapResult?.retryCount || 0) + 1;
+
+        if (sapError.failedStep && vendor.sapStepProgress && vendor.sapStepProgress[sapError.failedStep]) {
+          vendor.sapStepProgress[sapError.failedStep].status = 'FAILED';
+          vendor.sapStepProgress[sapError.failedStep].error = sapError.message;
+        }
+        await vendor.save();
+
+        return res.status(502).json({
+          message: 'SAP push resume failed',
+          error: sapError.message,
+          failedStep: sapError.failedStep || null,
+          partialVendorNumber: vendor.sapVendorNumber || vendor.sapResult?.partialVendorNumber,
+          sapStepProgress: vendor.sapStepProgress,
+          vendor,
+        });
+      }
+
+    } catch (err) { next(err); }
+  }
+);
 
 module.exports = router;

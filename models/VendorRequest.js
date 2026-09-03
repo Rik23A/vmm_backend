@@ -194,7 +194,7 @@ const VendorRequestSchema = new mongoose.Schema({
     controlKey: { type: String, default: 'EN' },
   }],
 
-  // ── Tax Details (India-specific) ──────────────────────────────────
+  // ── Tax Details (India-specific & ZBP_INDIA_SP_SRV) ───────────────
   taxDetails: {
     pan: {
       type: String,
@@ -206,13 +206,34 @@ const VendorRequestSchema = new mongoose.Schema({
       trim: true,
       uppercase: true,
     },
+    serviceRegNo: { type: String, trim: true, uppercase: true, maxlength: 40 },
+    cstNo: { type: String, trim: true, uppercase: true, maxlength: 40 },
+    lstNo: { type: String, trim: true, uppercase: true, maxlength: 40 },
+    gstVenClass: { type: String, maxlength: 1, default: ' ' }, // ' ': Registered, '0': Not Registered, '1': Composition, '2': SEZ, '3': SEZ Developer, '4': SEZ Unit
+    tanExemptions: [
+      {
+        companyCode: { type: String, trim: true, maxlength: 4, uppercase: true },
+        sectionCode: { type: String, trim: true, maxlength: 4, uppercase: true },
+        withholdingCode: { type: String, trim: true, maxlength: 2, uppercase: true },
+        withholdingTaxType: { type: String, trim: true, maxlength: 2, uppercase: true },
+        validFrom: { type: Date },
+        validTo: { type: Date },
+        exemptionNumber: { type: String, trim: true, maxlength: 15 },
+        exemptionRate: { type: Number, default: 0 },
+        exemThreshold: { type: Number, default: 0 },
+        currency: { type: String, trim: true, maxlength: 5, default: 'INR' },
+      }
+    ],
     msmeStatus: {
       type: String,
-      enum: ['NONE', 'MICRO', 'SMALL', 'MEDIUM'],
+      enum: ['NONE', 'MICRO', 'SMALL', 'MEDIUM', 'CANCELLED'],
       default: 'NONE',
     },
     msmeNumber: { type: String, trim: true },
     msmeRegDate: { type: Date, default: null },
+    msmeValTo: { type: Date, default: null },
+    msmeEntryDate: { type: Date, default: null },
+    msmeRegion: { type: String, trim: true },
     tin: { type: String, trim: true },
   },
 
@@ -251,16 +272,54 @@ const VendorRequestSchema = new mongoose.Schema({
     default: 0,
   },
 
-  // ── SAP Integration Result ────────────────────────────────────────
+  // ── SAP Integration Result & Step-by-Step Checkpointing ──────────
   sapResult: {
     vendorNumber: { type: String, default: null },   // Real SAP vendor number (0000012345)
+    partialVendorNumber: { type: String, default: null }, // BP generated if later steps fail
     pushedAt: { type: Date, default: null },
     pushedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     sapVersion: { type: String },                     // Which SAP version was used: ECC | S4HANA | STUB
     requestPayload: { type: Object, default: null },  // What was sent to SAP (for debugging)
     responsePayload: { type: Object, default: null }, // What SAP returned
     errorMessage: { type: String, default: null },
+    failedStep: { type: String, default: null },       // e.g. 'step3_companyCode', 'step5_indiaTax'
     retryCount: { type: Number, default: 0 },
+  },
+
+  // Granular step progress for resuming interrupted/failed pushes
+  sapStepProgress: {
+    step1_bp: {
+      status: { type: String, enum: ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'SKIPPED'], default: 'PENDING' },
+      bpNumber: { type: String, default: null },
+      completedAt: { type: Date, default: null },
+      error: { type: String, default: null },
+    },
+    step2_roles_cvi: {
+      status: { type: String, enum: ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'SKIPPED'], default: 'PENDING' },
+      supplierNumber: { type: String, default: null },
+      completedAt: { type: Date, default: null },
+      error: { type: String, default: null },
+    },
+    step3_companyCode: {
+      status: { type: String, enum: ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'SKIPPED'], default: 'PENDING' },
+      completedAt: { type: Date, default: null },
+      error: { type: String, default: null },
+    },
+    step4_purchasingOrg: {
+      status: { type: String, enum: ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'SKIPPED'], default: 'PENDING' },
+      completedAt: { type: Date, default: null },
+      error: { type: String, default: null },
+    },
+    step5_indiaTax: {
+      status: { type: String, enum: ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'SKIPPED'], default: 'PENDING' },
+      completedAt: { type: Date, default: null },
+      error: { type: String, default: null },
+    },
+    step6_attachments: {
+      status: { type: String, enum: ['PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED', 'SKIPPED'], default: 'PENDING' },
+      completedAt: { type: Date, default: null },
+      error: { type: String, default: null },
+    },
   },
 
   // ── Delta tracking for MODIFY requests ───────────────────────────

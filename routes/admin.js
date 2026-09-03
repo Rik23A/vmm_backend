@@ -10,10 +10,13 @@ const { sendEmail } = require('../utils/email');
 
 
 // ── GET /api/admin/users ────────────────────────────────────────────
-router.get('/users', requireLogin, requireRole('ADMIN'), async (req, res, next) => {
+router.get('/users', requireLogin, requireRole('ADMIN', 'L1_APPROVER'), async (req, res, next) => {
   try {
     const { search, role, isActive } = req.query;
     const query = { tenantId: req.tenantId };
+    if (req.user.role === 'L1_APPROVER') {
+      query.createdBy = req.user._id;
+    }
     if (role) query.role = role;
     if (isActive !== undefined) query.isActive = isActive === 'true';
     if (search) query.$or = [
@@ -26,7 +29,7 @@ router.get('/users', requireLogin, requireRole('ADMIN'), async (req, res, next) 
 });
 
 // ── POST /api/admin/users ───────────────────────────────────────────
-router.post('/users', requireLogin, injectTenant, requireRole('ADMIN'), [
+router.post('/users', requireLogin, injectTenant, requireRole('ADMIN', 'L1_APPROVER'), [
   body('fullName').trim().notEmpty().withMessage('Full name is required'),
   body('email').isEmail().normalizeEmail(),
   body('password').isLength({ min: 8 }).withMessage('Password min 8 chars'),
@@ -36,6 +39,9 @@ router.post('/users', requireLogin, injectTenant, requireRole('ADMIN'), [
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
     const { fullName, email, password, role, plants, sapVendorNumber } = req.body;
+    if (req.user.role === 'L1_APPROVER' && role !== 'REQUESTOR') {
+      return res.status(403).json({ message: 'L1 Approvers can only create Requestor (vendor) accounts' });
+    }
     const exists = await User.findOne({ email, tenantId: req.tenantId });
     if (exists) return res.status(409).json({ message: 'User with this email already exists' });
 
@@ -92,10 +98,18 @@ router.post('/users', requireLogin, injectTenant, requireRole('ADMIN'), [
 });
 
 // ── PATCH /api/admin/users/:id ─────────────────────────────────────
-router.patch('/users/:id', requireLogin, requireRole('ADMIN'), async (req, res, next) => {
+router.patch('/users/:id', requireLogin, requireRole('ADMIN', 'L1_APPROVER'), async (req, res, next) => {
   try {
     const user = await User.findOne({ _id: req.params.id, tenantId: req.tenantId });
     if (!user) return res.status(404).json({ message: 'User not found' });
+    if (req.user.role === 'L1_APPROVER') {
+      if (user.role !== 'REQUESTOR' || !user.createdBy || user.createdBy.toString() !== req.user._id.toString()) {
+        return res.status(403).json({ message: 'You are not authorized to modify this user' });
+      }
+      if (req.body.role && req.body.role !== 'REQUESTOR') {
+        return res.status(403).json({ message: 'L1 Approvers can only set role to REQUESTOR' });
+      }
+    }
     if (user._id.toString() === req.user._id.toString()) {
       return res.status(400).json({ message: 'You cannot modify your own account here' });
     }
@@ -128,10 +142,15 @@ router.patch('/users/:id', requireLogin, requireRole('ADMIN'), async (req, res, 
 });
 
 // ── DELETE /api/admin/users/:id ────────────────────────────────────
-router.delete('/users/:id', requireLogin, requireRole('ADMIN'), async (req, res, next) => {
+router.delete('/users/:id', requireLogin, requireRole('ADMIN', 'L1_APPROVER'), async (req, res, next) => {
   try {
     const user = await User.findOne({ _id: req.params.id, tenantId: req.tenantId });
     if (!user) return res.status(404).json({ message: 'User not found' });
+    if (req.user.role === 'L1_APPROVER') {
+      if (user.role !== 'REQUESTOR' || !user.createdBy || user.createdBy.toString() !== req.user._id.toString()) {
+        return res.status(403).json({ message: 'You are not authorized to delete this user' });
+      }
+    }
     if (user._id.toString() === req.user._id.toString()) {
       return res.status(400).json({ message: 'You cannot delete your own account' });
     }
@@ -155,7 +174,7 @@ router.delete('/users/:id', requireLogin, requireRole('ADMIN'), async (req, res,
 });
 
 // ── GET /api/admin/settings ─────────────────────────────────────────
-router.get('/settings', requireLogin, requireRole('ADMIN'), async (req, res, next) => {
+router.get('/settings', requireLogin, requireRole('ADMIN', 'L1_APPROVER'), async (req, res, next) => {
   try {
     const tenant = await Tenant.findOne({ tenantId: req.tenantId }).select('+geminiConfig.geminiApiKey');
     if (!tenant) return res.status(404).json({ message: 'Tenant not found' });
@@ -346,7 +365,7 @@ router.put('/workflow-settings', requireLogin, requireRole('ADMIN'), async (req,
 
 // ── GET /api/admin/roles ────────────────────────────────────────────
 // Returns both standard system roles and dynamic tenant-specific roles
-router.get('/roles', requireLogin, requireRole('ADMIN'), async (req, res, next) => {
+router.get('/roles', requireLogin, requireRole('ADMIN', 'L1_APPROVER'), async (req, res, next) => {
   try {
     const CustomRole = require('../models/CustomRole');
     const customRoles = await CustomRole.find({ tenantId: req.tenantId }).sort({ createdAt: 1 });

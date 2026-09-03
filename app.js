@@ -9,16 +9,36 @@ const connectDB = require('./config/db');
 
 const app = express();
 
+// Trust proxy to get correct client IP address
+app.set('trust proxy', 1);
+
 // ── Connect to MongoDB Atlas ────────────────────────────────────────
 connectDB();
 
 // ── Security Middleware ─────────────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-// Rate limiting: 100 requests per 15 minutes per IP
+const jwt = require('jsonwebtoken');
+
+// Rate limiting: 1000 requests per 15 minutes, tracked by User ID (if authenticated) or IP address
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 1000,
+  keyGenerator: (req) => {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.decode(token);
+        if (decoded && decoded.userId) {
+          return `user_${decoded.userId}`;
+        }
+      } catch (err) {
+        // Fallback on error
+      }
+    }
+    return req.ip;
+  },
   message: { message: 'Too many requests, please try again later.' },
 });
 app.use('/api/', limiter);

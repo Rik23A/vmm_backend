@@ -143,7 +143,7 @@ const validateVendorSubmission = (data, checkAll = false, options = {}) => {
       if (!bank.bankCountry?.trim()) {
         errors.push({ field: `bankDetails[${i}].bankCountry`, message: 'Bank country is required' });
       }
-      if (!bank.bankKey?.trim()) {
+      if (checkAll && !bank.bankKey?.trim()) {
         errors.push({ field: `bankDetails[${i}].bankKey`, message: 'Bank key is required' });
       }
       if (bank.bankCountry === 'IN' || !bank.bankCountry) {

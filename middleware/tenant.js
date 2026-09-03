@@ -48,6 +48,7 @@ const getSapConfig = (tenant) => {
     sapUser: tc.sapUser || process.env.SAP_USER || '',
     sapPassword: tc.sapPassword || process.env.SAP_PASSWORD || '',
     sapOdataUrl: tc.sapOdataUrl || process.env.SAP_ODATA_URL || '',
+    sapIndiaTaxOdataUrl: tc.sapIndiaTaxOdataUrl || process.env.SAP_INDIA_TAX_ODATA_URL || '',
     companyCodes: tc.companyCodes || [],
     purchasingOrgs: tc.purchasingOrgs || [],
     sapBpGrouping: tc.sapBpGrouping || process.env.SAP_BP_GROUPING || 'ZV01',
