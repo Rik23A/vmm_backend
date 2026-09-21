@@ -12,6 +12,7 @@ const axios = require('axios');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
+const { getMimeType, getFileExtension, getContentDisposition } = require('./mimeHelper');
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const CSRF_TTL_MS = 25 * 60 * 1000; // 25 min
@@ -25,15 +26,28 @@ const _csrfCache = new Map();
 
 /**
  * Resolve the base OData URL for ZBP_INDIA_SP_SRV
+ *
+ * Production URL (Port 44301):  https://sapwd.birla-sugar.com:44301/sap/opu/odata/sap/ZBP_INDIA_SP_SRV
+ * Development URL (Port 44300): https://sapwd.birla-sugar.com:44300/sap/opu/odata/sap/ZBP_INDIA_SP_SRV
  */
 const resolveIndiaTaxUrl = (cfg = {}) => {
+  // 1. DB config (tenant.sapConfig.sapIndiaTaxOdataUrl) takes top priority
   if (cfg.sapIndiaTaxOdataUrl && cfg.sapIndiaTaxOdataUrl.trim()) {
     return cfg.sapIndiaTaxOdataUrl.trim().replace(/\/$/, '');
   }
+  // 2. Base sapOdataUrl derived (replacing API_BUSINESS_PARTNER with ZBP_INDIA_SP_SRV, preserves host & port)
   if (cfg.sapOdataUrl && cfg.sapOdataUrl.trim()) {
     return cfg.sapOdataUrl.trim().replace(/API_BUSINESS_PARTNER\/?$/i, 'ZBP_INDIA_SP_SRV').replace(/\/$/, '');
   }
-  return 'https://sapwd.birla-sugar.com:44300/sap/opu/odata/sap/ZBP_INDIA_SP_SRV';
+  // 3. Environment-aware default fallback:
+  // Production (Port 44301) vs Development (Port 44300)
+  const isProd = process.env.NODE_ENV === 'production'
+    || String(cfg.sapSystemId || '').toUpperCase() === 'PRD'
+    || String(cfg.sapClient || '') === '800';
+
+  return isProd
+    ? 'https://sapwd.birla-sugar.com:44301/sap/opu/odata/sap/ZBP_INDIA_SP_SRV'
+    : 'https://sapwd.birla-sugar.com:44300/sap/opu/odata/sap/ZBP_INDIA_SP_SRV';
 };
 
 const _cacheKey = (cfg) => `${resolveIndiaTaxUrl(cfg)}::${cfg.sapClient || '100'}::${cfg.sapUser}`;
@@ -352,55 +366,281 @@ const postIndiaTaxDetails = async (cfg, bpNumber, vendorData) => {
 
 /**
  * Upload a document stream to BPAttachmentSet
+ * Verified in Postman:
+ * POST /sap/opu/odata/sap/ZBP_INDIA_SP_SRV/BPAttachmentSet
+ * Headers:
+ *   Slug: 0001013533;Sample_Document.pdf  (<10-digit-BP>;<Actual_File_Name>)
+ *   Content-Type: application/pdf (or application/octet-stream)
+ *   Accept: application/json
+ *   x-csrf-token: <active_token>
+ * Body: binary buffer
  */
 const uploadIndiaTaxAttachment = async (cfg, bpNumber, documentItem) => {
   const mode = (cfg.sapVersion || 'STUB').toUpperCase();
-  if (mode === 'STUB') {
-    console.log(`🧪 [SAP IndiaTax STUB] Simulated attachment upload for BP: ${bpNumber}, file: ${documentItem?.fileName}`);
-    return { status: 'ATTACHED_STUB', fileName: documentItem?.fileName };
-  }
 
+  // 1. Ensure Business Partner is 10-digit zero-padded (e.g. 0001013533)
   let formattedBp = String(bpNumber || '').trim();
   if (/^\d+$/.test(formattedBp) && formattedBp.length < 10) {
     formattedBp = formattedBp.padStart(10, '0');
   }
 
-  const filePath = documentItem.filePath ? path.resolve(process.cwd(), documentItem.filePath) : null;
-  if (!filePath || !fs.existsSync(filePath)) {
-    console.warn(`⚠️ [SAP IndiaTax Attachment] File not found on disk: ${filePath}, skipping upload.`);
-    return null;
+  // 2. CRITICAL: Use the actual original file name (e.g. "Sample_Document.pdf" or "GST_Certificate.pdf")
+  // Sanitize illegal separator characters (';' or path separators) so SAP's SPLIT AT ';' functions properly
+  const rawFileName = documentItem?.fileName ||
+    (documentItem?.filePath ? path.basename(documentItem.filePath) : 'Document.pdf');
+  const safeFileName = rawFileName.replace(/[;/\\]/g, '_').trim();
+  const fileExt = getFileExtension(safeFileName, 'pdf').toUpperCase();
+  const mimeType = (documentItem?.mimeType && documentItem.mimeType !== 'application/octet-stream')
+    ? documentItem.mimeType
+    : getMimeType(safeFileName, 'application/pdf');
+
+  if (mode === 'STUB') {
+    const stubId = `FOL37000000000004EXT${Date.now().toString().slice(-8)}`;
+    console.log(`🧪 [SAP IndiaTax STUB] Simulated attachment upload for BP: ${formattedBp}, file: ${safeFileName}`);
+    return {
+      status: 'ATTACHED_STUB',
+      attachmentId: stubId,
+      AttachmentId: stubId,
+      fileName: safeFileName,
+      FileName: safeFileName,
+      fileExt: fileExt,
+      FileExt: fileExt,
+      mimeType: mimeType,
+      MimeType: mimeType,
+      businessPartner: formattedBp,
+      BusinessPartner: formattedBp,
+      mediaSrc: `${resolveIndiaTaxUrl(cfg)}/BPAttachmentSet('${stubId}')/$value`,
+    };
   }
 
-  const fileBuffer = fs.readFileSync(filePath);
-  const fileName = documentItem.fileName || path.basename(filePath);
-  const mimeType = documentItem.mimeType || 'application/pdf';
+  // 3. Obtain binary buffer: from in-memory buffer or from disk file
+  let fileBuffer = null;
+  if (documentItem.buffer && Buffer.isBuffer(documentItem.buffer)) {
+    fileBuffer = documentItem.buffer;
+  } else if (documentItem.filePath) {
+    let resolvedPath = null;
+    try {
+      const { getSafeAbsolutePath } = require('../config/storage');
+      resolvedPath = getSafeAbsolutePath(documentItem.filePath);
+    } catch (_) {
+      // ignore
+    }
+    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
+      const fallback = path.isAbsolute(documentItem.filePath)
+        ? documentItem.filePath
+        : path.resolve(process.cwd(), documentItem.filePath);
+      if (fs.existsSync(fallback)) {
+        resolvedPath = fallback;
+      }
+    }
+    if (!resolvedPath || !fs.existsSync(resolvedPath)) {
+      console.warn(`⚠️ [SAP IndiaTax Attachment] File not found on disk: ${documentItem.filePath}, skipping upload.`);
+      return null;
+    }
+    fileBuffer = fs.readFileSync(resolvedPath);
+  }
 
-  console.log(`📤 [SAP IndiaTax Attachment] Uploading ${fileName} (${mimeType}) for BP ${formattedBp}…`);
+  if (!fileBuffer) {
+    throw new Error(`[SAP IndiaTax Attachment] No binary file content found to upload for BP ${formattedBp}`);
+  }
 
+  console.log(`📤 [SAP IndiaTax Attachment] Uploading '${safeFileName}' (${mimeType}) for BP ${formattedBp}…`);
+
+  // Slug header format verified in Postman: <10-digit-BP>;<Actual_File_Name>
   const headers = {
     'Content-Type': mimeType,
-    'Slug': `${formattedBp}/${fileName}`,
-    'BusinessPartner': formattedBp,
+    'Slug': `${formattedBp};${safeFileName}`,
+    'Accept': 'application/json',
   };
 
   const res = await sapIndiaTaxWrite(cfg, 'POST', '/BPAttachmentSet', fileBuffer, headers);
-  console.log(`✅ [SAP IndiaTax Attachment] Uploaded ${fileName} successfully`);
-  return res.data?.d || res.data;
+  console.log(`✅ [SAP IndiaTax Attachment] Uploaded '${safeFileName}' successfully`);
+
+  const attData = res.data?.d || res.data || {};
+  const attachmentId = attData.AttachmentId || attData.attachmentId;
+
+  return {
+    attachmentId: attachmentId,
+    AttachmentId: attachmentId,
+    businessPartner: attData.BusinessPartner || attData.businessPartner || formattedBp,
+    BusinessPartner: attData.BusinessPartner || attData.businessPartner || formattedBp,
+    fileName: attData.FileName || safeFileName,
+    FileName: attData.FileName || safeFileName,
+    fileExt: attData.FileExt || safeFileName.split('.').pop().toUpperCase(),
+    FileExt: attData.FileExt || safeFileName.split('.').pop().toUpperCase(),
+    mimeType: attData.MimeType || mimeType,
+    MimeType: attData.MimeType || mimeType,
+    mediaSrc: attData.__metadata?.media_src || (attachmentId ? `${resolveIndiaTaxUrl(cfg)}/BPAttachmentSet('${attachmentId}')/$value` : null),
+    raw: attData,
+  };
 };
 
 /**
- * Read India Tax & TAN details from SAP
+ * Query BPAttachmentSet for a Business Partner from SAP
+ * Verified in Postman:
+ * GET /sap/opu/odata/sap/ZBP_INDIA_SP_SRV/BPAttachmentSet?$filter=BusinessPartner eq '1003818'
+ */
+const getBPAttachments = async (cfg, bpNumber) => {
+  const mode = (cfg.sapVersion || 'STUB').toUpperCase();
+  if (mode === 'STUB') {
+    return [
+      {
+        attachmentId: 'FOL37000000000004EXT51000000168324',
+        AttachmentId: 'FOL37000000000004EXT51000000168324',
+        businessPartner: String(bpNumber || '0001003818'),
+        BusinessPartner: String(bpNumber || '0001003818'),
+        fileName: 'GST_Certificate.pdf',
+        FileName: 'GST_Certificate.pdf',
+        fileExt: 'PDF',
+        FileExt: 'PDF',
+        mimeType: 'application/pdf',
+        MimeType: 'application/pdf',
+        mediaSrc: `${resolveIndiaTaxUrl(cfg)}/BPAttachmentSet('FOL37000000000004EXT51000000168324')/$value`,
+      },
+      {
+        attachmentId: 'FOL37000000000004EXT51000000160626',
+        AttachmentId: 'FOL37000000000004EXT51000000160626',
+        businessPartner: String(bpNumber || '0001003818'),
+        BusinessPartner: String(bpNumber || '0001003818'),
+        fileName: 'deepa enterprises.pdf',
+        FileName: 'deepa enterprises.pdf',
+        fileExt: 'PDF',
+        FileExt: 'PDF',
+        mimeType: 'application/pdf',
+        MimeType: 'application/pdf',
+        mediaSrc: `${resolveIndiaTaxUrl(cfg)}/BPAttachmentSet('FOL37000000000004EXT51000000160626')/$value`,
+      }
+    ];
+  }
+
+  const cleanBp = String(bpNumber || '').trim();
+  const unpaddedBp = cleanBp.replace(/^0+/, '');
+  const paddedBp = /^\d+$/.test(unpaddedBp) ? unpaddedBp.padStart(10, '0') : cleanBp;
+
+  // Filter expression: supports unpadded ('1003818') or padded ('0001003818')
+  let filterExpr = `BusinessPartner eq '${cleanBp}'`;
+  if (unpaddedBp && paddedBp && unpaddedBp !== paddedBp) {
+    filterExpr = `BusinessPartner eq '${unpaddedBp}' or BusinessPartner eq '${paddedBp}'`;
+  }
+
+  const endpoint = `/BPAttachmentSet?$filter=${encodeURIComponent(filterExpr)}&$format=json`;
+  console.log(`📥 [SAP IndiaTax] Querying BP attachments: ${endpoint}`);
+
+  try {
+    const res = await sapIndiaTaxRead(cfg, endpoint);
+    const results = res.data?.d?.results || (Array.isArray(res.data?.d) ? res.data.d : (res.data?.results || []));
+    return results.map(item => {
+      const attId = item.AttachmentId;
+      const fName = item.FileName || `${attId}.${(item.FileExt || 'pdf').toLowerCase()}`;
+      const fExt = (item.FileExt || getFileExtension(fName, 'pdf')).toUpperCase();
+      const detectedMime = getMimeType(fName) || getMimeType(fExt);
+      const finalMime = (item.MimeType && item.MimeType !== 'application/octet-stream')
+        ? item.MimeType
+        : detectedMime;
+
+      return {
+        attachmentId: attId,
+        AttachmentId: attId,
+        businessPartner: item.BusinessPartner,
+        BusinessPartner: item.BusinessPartner,
+        fileName: fName,
+        FileName: fName,
+        fileExt: fExt,
+        FileExt: fExt,
+        mimeType: finalMime,
+        MimeType: finalMime,
+        mediaSrc: item.__metadata?.media_src || `${resolveIndiaTaxUrl(cfg)}/BPAttachmentSet('${attId}')/$value`,
+        uri: item.__metadata?.uri,
+        raw: item,
+      };
+    });
+  } catch (err) {
+    console.warn(`⚠️ [SAP IndiaTax] Failed to query BP attachments for BP ${bpNumber}:`, err.message);
+    return [];
+  }
+};
+
+/**
+ * Download attachment binary stream from SAP BPAttachmentSet
+ * Verified in Postman:
+ * GET /sap/opu/odata/sap/ZBP_INDIA_SP_SRV/BPAttachmentSet('<AttachmentId>')/$value
+ */
+const downloadBPAttachmentStream = async (cfg, attachmentId, preferredFileName = null) => {
+  const mode = (cfg.sapVersion || 'STUB').toUpperCase();
+  const ext = preferredFileName ? getFileExtension(preferredFileName) : 'pdf';
+  const inferredMime = preferredFileName ? getMimeType(preferredFileName) : 'application/pdf';
+
+  if (mode === 'STUB') {
+    const stubPdf = Buffer.from(`%PDF-1.4 STUB ATTACHMENT STREAM FOR ${attachmentId}`);
+    return {
+      data: stubPdf,
+      contentType: inferredMime,
+      contentDisposition: getContentDisposition(preferredFileName || `${attachmentId}.${ext}`, inferredMime),
+      status: 200,
+    };
+  }
+
+  const instance = _indiaTaxInstance(cfg);
+  const entry = _csrfCache.get(_cacheKey(cfg));
+  const hdrs = (entry && entry.cookie) ? { Cookie: entry.cookie } : {};
+  const cleanId = String(attachmentId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!cleanId) {
+    throw new Error('[SAP IndiaTax] Invalid attachment ID specified.');
+  }
+  const endpoint = `/BPAttachmentSet('${cleanId}')/$value`;
+
+  console.log(`📥 [SAP IndiaTax] Downloading attachment stream: ${endpoint}`);
+  const res = await instance.get(endpoint, {
+    headers: {
+      ...hdrs,
+      Accept: '*/*',
+    },
+    responseType: 'arraybuffer',
+  });
+
+  // Extract or infer content-type and filename
+  let contentType = res.headers['content-type'];
+  if (!contentType || contentType === 'application/octet-stream') {
+    contentType = inferredMime;
+  }
+
+  let resolvedFileName = preferredFileName;
+  const sapDisposition = res.headers['content-disposition'];
+  if (!resolvedFileName && sapDisposition) {
+    const match = sapDisposition.match(/filename=["']?([^"';]+)["']?/i);
+    if (match && match[1]) {
+      resolvedFileName = match[1].trim();
+      contentType = getMimeType(resolvedFileName, contentType);
+    }
+  }
+
+  if (!resolvedFileName) {
+    const extFromMime = getFileExtension(contentType, 'pdf');
+    resolvedFileName = `${cleanId}.${extFromMime}`;
+  }
+
+  return {
+    data: Buffer.from(res.data),
+    contentType,
+    contentDisposition: getContentDisposition(resolvedFileName, contentType),
+    status: res.status,
+  };
+};
+
+/**
+ * Read India Tax & TAN details from SAP, augmented with live BPAttachmentSet attachments
  */
 const getIndiaTaxDetails = async (cfg, bpNumber) => {
   const mode = (cfg.sapVersion || 'STUB').toUpperCase();
   if (mode === 'STUB') {
+    const stubAtts = await getBPAttachments(cfg, bpNumber);
     return {
       BusinessPartner: bpNumber,
       PAN: 'AABCS1234F',
       ServiceRegNo: 'SRN999888',
       GstVenClass: '1',
       ToTanExemption: { results: [] },
-      ToAttachments: { results: [] }
+      ToAttachments: { results: stubAtts }
     };
   }
 
@@ -409,9 +649,19 @@ const getIndiaTaxDetails = async (cfg, bpNumber) => {
     formattedBp = formattedBp.padStart(10, '0');
   }
 
-  const endpoint = `/IndiaTaxGeneralSet('${formattedBp}')?$expand=ToTanExemption,ToAttachments&$format=json`;
-  const res = await sapIndiaTaxRead(cfg, endpoint);
-  return res.data?.d || res.data || null;
+  // Fetch tax general data and attachments in parallel
+  const [taxRes, attachments] = await Promise.allSettled([
+    sapIndiaTaxRead(cfg, `/IndiaTaxGeneralSet('${formattedBp}')?$expand=ToTanExemption&$format=json`),
+    getBPAttachments(cfg, bpNumber)
+  ]);
+
+  const taxData = taxRes.status === 'fulfilled' ? (taxRes.value?.data?.d || taxRes.value?.data || {}) : {};
+  const attResults = attachments.status === 'fulfilled' ? attachments.value : [];
+
+  taxData.BusinessPartner = taxData.BusinessPartner || formattedBp;
+  taxData.ToAttachments = { results: attResults };
+
+  return taxData;
 };
 
 module.exports = {
@@ -424,5 +674,7 @@ module.exports = {
   _buildIndiaTaxPayload,
   postIndiaTaxDetails,
   uploadIndiaTaxAttachment,
+  getBPAttachments,
+  downloadBPAttachmentStream,
   getIndiaTaxDetails,
 };

@@ -495,6 +495,9 @@ router.post('/:id/sap-push', requireLogin, requireRole('MASTER_DATA', 'ADMIN'),
 
         // ── SUCCESS: Store real SAP vendor number — this replaces the temp number for all future work
         vendor.sapVendorNumber = result.vendorNumber;
+        if (Array.isArray(result.documents) && result.documents.length > 0) {
+          vendor.documents = result.documents;
+        }
         vendor.status = 'SAP_PUSHED';
         vendor.currentLevel = 'DONE';
         vendor.sapResult = {

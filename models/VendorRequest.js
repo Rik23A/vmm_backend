@@ -62,7 +62,12 @@ const DocumentSchema = new mongoose.Schema({
     ocrEngine: { type: String, default: null },
     error: { type: String, default: null },
     processedAt: { type: Date, default: null }
-  }
+  },
+  sapAttachmentId: { type: String, default: null },
+  sapUploaded: { type: Boolean, default: false },
+  sapUploadedAt: { type: Date, default: null },
+  sapUploadStatus: { type: String, enum: ['NOT_UPLOADED', 'UPLOADED', 'FAILED', 'SKIPPED'], default: 'NOT_UPLOADED' },
+  sapUploadError: { type: String, default: null }
 });
 
 // ── Main VendorRequest Schema ─────────────────────────────────────────
@@ -133,6 +138,7 @@ const VendorRequestSchema = new mongoose.Schema({
 
   generalData: {
     vendorName: { type: String, trim: true, maxlength: 35 },
+    tradeName: { type: String, trim: true, maxlength: 40, default: '' },
     searchTerm: { type: String, trim: true, uppercase: true, maxlength: 20 },
     vendorType: { type: String, enum: ['DOMESTIC', 'INTERNATIONAL'], default: 'DOMESTIC' },
     title: { type: String, trim: true, default: null }, // Title / Form of Address code (e.g. 0003)

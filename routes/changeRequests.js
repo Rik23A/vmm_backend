@@ -13,28 +13,9 @@ const { injectTenant, getSapConfig, getGeminiConfig } = require('../middleware/t
 const { pushVendorChangeRequest } = require('../utils/sapBridge');
 const { sendEmail } = require('../utils/email');
 
-// Multer config for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '..', 'uploads', req.tenantId);
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${uuidv4()}${ext}`);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: parseInt(process.env.UPLOAD_MAX_SIZE || '5242880') },
-  fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'image/jpeg', 'image/png'];
-    if (allowed.includes(file.mimetype)) return cb(null, true);
-    cb(new Error('Only PDF, JPG, and PNG files are allowed'));
-  },
-});
+// ── Multer: Secure external storage outside backend directory ─────────
+const { secureUpload, getSafeAbsolutePath } = require('../config/storage');
+const upload = secureUpload;
 
 // ── GET /api/change-requests ──────────────────────────────────────────
 // List change requests scoped by Tenant
@@ -218,7 +199,7 @@ router.post('/draft', requireLogin, injectTenant, upload.array('files'), async (
         if (isOcrEnabled && ['GST_CERTIFICATE', 'PAN_CARD', 'CANCELLED_CHEQUE'].includes(docType)) {
           try {
             const ocrService = require('../utils/ocrService');
-            const fullPath = path.join(__dirname, '..', doc.filePath);
+            const fullPath = getSafeAbsolutePath(doc.filePath, req.tenantId);
             const ocrResult = await ocrService.validateDocument(fullPath, doc.docType, doc.mimeType, vendorDataForOcr, geminiConfig, req.tenantId);
             if (ocrResult) {
               doc.ocrResult = ocrResult;
@@ -312,7 +293,7 @@ router.put('/:id', requireLogin, injectTenant, upload.array('files'), async (req
         if (isOcrEnabled && ['GST_CERTIFICATE', 'PAN_CARD', 'CANCELLED_CHEQUE'].includes(docType)) {
           try {
             const ocrService = require('../utils/ocrService');
-            const fullPath = path.join(__dirname, '..', doc.filePath);
+            const fullPath = getSafeAbsolutePath(doc.filePath, req.tenantId);
             const ocrResult = await ocrService.validateDocument(fullPath, doc.docType, doc.mimeType, vendorDataForOcr, geminiConfig, req.tenantId);
             if (ocrResult) {
               doc.ocrResult = ocrResult;

@@ -69,9 +69,9 @@ if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'));
 }
 
-// ── Serve uploaded files ─────────────────────────────────────────────
-// Documents stored in /uploads folder in app root — accessible via /uploads/filename
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// ── Secure Document Serving ──────────────────────────────────────────
+// Authenticated, tenant-isolated document access (replaces public static serving)
+app.use('/uploads', require('./routes/documents'));
 
 // ── Health Check ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {

@@ -97,6 +97,9 @@ const validateVendorSubmission = (data, checkAll = false, options = {}) => {
   if (!data.generalData?.vendorName?.trim()) {
     errors.push({ field: 'generalData.vendorName', message: 'Vendor name is required' });
   }
+  if (data.generalData?.tradeName && data.generalData.tradeName.length > 40) {
+    errors.push({ field: 'generalData.tradeName', message: 'Trade Name cannot exceed 40 characters' });
+  }
   if (!data.generalData?.street?.trim()) {
     errors.push({ field: 'generalData.street', message: 'Street address is required' });
   }

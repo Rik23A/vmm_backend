@@ -42,7 +42,12 @@ const DocumentSchema = new mongoose.Schema({
     ocrEngine: { type: String, default: null },
     error: { type: String, default: null },
     processedAt: { type: Date, default: null }
-  }
+  },
+  sapAttachmentId: { type: String, default: null },
+  sapUploaded: { type: Boolean, default: false },
+  sapUploadedAt: { type: Date, default: null },
+  sapUploadStatus: { type: String, enum: ['NOT_UPLOADED', 'UPLOADED', 'FAILED', 'SKIPPED'], default: 'NOT_UPLOADED' },
+  sapUploadError: { type: String, default: null }
 });
 
 // ── Main VendorChangeRequest Schema ──────────────────────────────────
@@ -105,6 +110,8 @@ const VendorChangeRequestSchema = new mongoose.Schema({
       msmeRegion: { type: String, trim: true }
     },
     addressDetails: {
+      careOfName: { type: String, trim: true, maxlength: 40 },
+      tradeName: { type: String, trim: true, maxlength: 40 },
       street: { type: String, trim: true },
       houseNumber: { type: String, trim: true },
       city: { type: String, trim: true },

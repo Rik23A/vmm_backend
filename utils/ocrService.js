@@ -4,15 +4,29 @@ const OcrUsage = require('../models/OcrUsage');
 
 // Default daily request limits per model
 const MODEL_DAILY_LIMITS = {
-  'gemini-3.5-flash-lite': 400,
   'gemma-4-31b-it': 5000,
+  'gemini-3.5-flash-lite': 400,
+  'gemini-3.1-flash-lite': 400,
+  'gemini-2.5-flash': 10,
 };
 
-function getModelDailyLimit(modelName) {
+function getModelDailyLimit(modelName, geminiConfig = {}) {
+  // 1. Check custom limit set specifically for primary or fallback in settings
+  if (geminiConfig.primaryModel === modelName && geminiConfig.primaryDailyLimit) {
+    return Number(geminiConfig.primaryDailyLimit);
+  }
+  if (geminiConfig.fallbackModel === modelName && geminiConfig.fallbackDailyLimit) {
+    return Number(geminiConfig.fallbackDailyLimit);
+  }
+  // 2. Check model-specific dictionary map if configured
+  if (geminiConfig.modelDailyLimits && geminiConfig.modelDailyLimits[modelName]) {
+    return Number(geminiConfig.modelDailyLimits[modelName]);
+  }
+  // 3. Fall back to preset defaults
   if (MODEL_DAILY_LIMITS[modelName] !== undefined) {
     return MODEL_DAILY_LIMITS[modelName];
   }
-  return 1000; // Default fallback for any other custom model
+  return 300; // Default fallback for any other custom model
 }
 
 /**
@@ -57,10 +71,21 @@ async function validateDocument(filePath, docType, mimeType, vendorData, geminiC
 
   const ai = new GoogleGenAI({ apiKey });
 
-  const primaryModel = geminiConfig.primaryModel || geminiConfig.geminiModel || process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
-  const fallbackModel = geminiConfig.fallbackModel && geminiConfig.fallbackModel !== 'NONE' ? geminiConfig.fallbackModel : 'gemma-4-31b-it';
+  const primaryModel = geminiConfig.primaryModel || geminiConfig.geminiModel || process.env.GEMINI_MODEL || 'gemma-4-31b-it';
+  const fallbackModel = geminiConfig.fallbackModel && geminiConfig.fallbackModel !== 'NONE' ? geminiConfig.fallbackModel : 'gemini-3.5-flash-lite';
 
-  const docPart = fileToGenerativePart(filePath, mimeType);
+  let actualPath = filePath;
+  if (!fs.existsSync(actualPath)) {
+    try {
+      const { getSafeAbsolutePath } = require('../config/storage');
+      const safe = getSafeAbsolutePath(filePath, tenantId);
+      if (safe && fs.existsSync(safe)) {
+        actualPath = safe;
+      }
+    } catch (_) {}
+  }
+
+  const docPart = fileToGenerativePart(actualPath, mimeType);
 
   let prompt = '';
   let responseSchema = {};
@@ -69,13 +94,15 @@ async function validateDocument(filePath, docType, mimeType, vendorData, geminiC
     prompt = `You are an expert document parser. Read this GST certificate and extract:
 1. "gstin": The 15-character Goods and Services Tax Identification Number.
 2. "legalName": The Legal Name of Business or Company Name as stated in the registration details.
+3. "tradeName": The Trade Name if stated in the registration details (or empty string if none).
 Return the output strictly in the requested JSON structure.`;
     
     responseSchema = {
       type: "OBJECT",
       properties: {
         gstin: { type: "STRING", description: "15-char GSTIN number" },
-        legalName: { type: "STRING", description: "Legal name of the business" }
+        legalName: { type: "STRING", description: "Legal name of the business" },
+        tradeName: { type: "STRING", description: "Trade name of the business if stated" }
       },
       required: ["gstin", "legalName"]
     };
@@ -116,10 +143,10 @@ Return the output strictly in the requested JSON structure.`;
   // Fetch current request counts for today
   const dailyCounts = await OcrUsage.getCounts(tenantId, dateStr);
 
-  const primaryLimit = getModelDailyLimit(primaryModel);
+  const primaryLimit = getModelDailyLimit(primaryModel, geminiConfig);
   const primaryCount = dailyCounts[primaryModel] || 0;
 
-  const fallbackLimit = getModelDailyLimit(fallbackModel);
+  const fallbackLimit = getModelDailyLimit(fallbackModel, geminiConfig);
   const fallbackCount = dailyCounts[fallbackModel] || 0;
 
   console.log(`\n📊 [OCR TRACKER] Date: ${dateStr} | Tenant: ${tenantId}`);

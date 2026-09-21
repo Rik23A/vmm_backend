@@ -26,6 +26,10 @@ const VendorInvitationSchema = new mongoose.Schema({
     required: [true, 'Vendor name is required'],
     trim: true,
   },
+  tradeName: {
+    type: String,
+    trim: true,
+  },
   vendorGroup: {
     type: String,
     required: [true, 'Vendor Group is required'],

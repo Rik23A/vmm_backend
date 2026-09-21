@@ -7,13 +7,22 @@ const SuperAdmin = require('../models/SuperAdmin');
 const requireLogin = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    let token = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    } else if (req.query && req.query.token) {
+      token = req.query.token;
+    }
+
+    if (!token) {
       return res.status(401).json({ message: 'Access denied. No token provided.' });
     }
-    const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    const user = await User.findById(decoded.userId).select('-password');
+    let user = await User.findById(decoded.userId).select('-password');
+    if (!user && decoded.role === 'SUPER_ADMIN') {
+      user = await SuperAdmin.findById(decoded.userId).select('-password');
+    }
     if (!user) {
       return res.status(401).json({ message: 'User not found. Token invalid.' });
     }
@@ -22,7 +31,7 @@ const requireLogin = async (req, res, next) => {
     }
 
     req.user = user;
-    req.tenantId = user.tenantId; // Always scoped to user's tenant
+    req.tenantId = user.tenantId || (decoded.role === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : null);
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
@@ -72,10 +81,15 @@ const optionalLogin = async (req, res, next) => {
 const requireSuperAdminLogin = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    let token = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    } else if (req.query && req.query.token) {
+      token = req.query.token;
+    }
+    if (!token) {
       return res.status(401).json({ message: 'Access denied. No token provided.' });
     }
-    const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     if (decoded.role !== 'SUPER_ADMIN') {

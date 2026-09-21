@@ -67,8 +67,8 @@ const getSapConfig = (tenant) => {
 // ── getGeminiConfig ───────────────────────────────────────────────────
 const getGeminiConfig = (tenant) => {
   const gc = tenant?.geminiConfig || {};
-  const primaryModel = gc.primaryModel || gc.geminiModel || process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
-  const fallbackModel = gc.fallbackModel !== undefined ? gc.fallbackModel : 'gemma-4-31b-it';
+  const primaryModel = gc.primaryModel || gc.geminiModel || process.env.GEMINI_MODEL || 'gemma-4-31b-it';
+  const fallbackModel = gc.fallbackModel !== undefined ? gc.fallbackModel : 'gemini-3.5-flash-lite';
 
   return {
     enableOcrValidation: gc.enableOcrValidation !== undefined ? gc.enableOcrValidation : false,
@@ -76,6 +76,8 @@ const getGeminiConfig = (tenant) => {
     geminiModel: primaryModel,
     primaryModel,
     fallbackModel,
+    primaryDailyLimit: gc.primaryDailyLimit !== undefined ? gc.primaryDailyLimit : 5000,
+    fallbackDailyLimit: gc.fallbackDailyLimit !== undefined ? gc.fallbackDailyLimit : 400,
   };
 };
 

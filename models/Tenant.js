@@ -104,9 +104,11 @@ const TenantSchema = new mongoose.Schema({
   geminiConfig: {
     enableOcrValidation: { type: Boolean, default: false },
     geminiApiKey: { type: String, default: '', select: false }, // never returned in normal queries
-    geminiModel: { type: String, default: 'gemini-3.5-flash-lite' },
-    primaryModel: { type: String, default: 'gemini-3.5-flash-lite' },
-    fallbackModel: { type: String, default: 'gemma-4-31b-it' },
+    geminiModel: { type: String, default: 'gemma-4-31b-it' },
+    primaryModel: { type: String, default: 'gemma-4-31b-it' },
+    fallbackModel: { type: String, default: 'gemini-3.5-flash-lite' },
+    primaryDailyLimit: { type: Number, default: 5000 },
+    fallbackDailyLimit: { type: Number, default: 400 },
   },
 
   plants: {

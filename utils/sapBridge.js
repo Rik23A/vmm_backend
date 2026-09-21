@@ -445,6 +445,7 @@ const _buildBPPayload = (vendorData, cfg) => {
     // ── A_BusinessPartnerAddress (deep-insert) ───────────────────────────
     to_BusinessPartnerAddress: {
       results: [{
+        CareOfName:  generalData.tradeName  || '',
         StreetName:  generalData.street     || '',
         CityName:    generalData.city       || '',
         District:    generalData.district   || generalData.city || '', // Maps to CITY2 (District)
@@ -819,14 +820,59 @@ const pushToS4HANA = async (vendorData, cfg, options = {}) => {
       } else {
         await reportStep('step6_attachments', 'IN_PROGRESS');
         console.log(`📦 [Step 6] [TX-${txId}] Uploading ${vendorData.documents.length} attachments to SAP for BP: ${bpNumber}`);
+        const uploadedAttachments = [];
+        const failedAttachments = [];
+
         for (const doc of vendorData.documents) {
           try {
-            await sapIndiaTaxBridge.uploadIndiaTaxAttachment(cfg, bpNumber, doc);
+            console.log(`📤 [Step 6] [TX-${txId}] Uploading '${doc.fileName}' (${doc.docType}) for BP ${bpNumber}...`);
+            const attRes = await sapIndiaTaxBridge.uploadIndiaTaxAttachment(cfg, bpNumber, doc);
+            if (attRes) {
+              doc.sapAttachmentId = attRes.attachmentId || attRes.AttachmentId;
+              doc.sapUploaded = true;
+              doc.sapUploadStatus = 'UPLOADED';
+              doc.sapUploadedAt = new Date();
+              doc.sapUploadError = null;
+              uploadedAttachments.push({
+                docType: doc.docType,
+                fileName: doc.fileName,
+                attachmentId: doc.sapAttachmentId,
+                status: 'UPLOADED',
+              });
+            } else {
+              doc.sapUploaded = false;
+              doc.sapUploadStatus = 'FAILED';
+              doc.sapUploadError = 'File missing from storage or empty file buffer';
+              failedAttachments.push({
+                docType: doc.docType,
+                fileName: doc.fileName,
+                error: doc.sapUploadError,
+                status: 'FAILED',
+              });
+            }
           } catch (attErr) {
             console.warn(`⚠️ [Step 6] [TX-${txId}] Attachment upload failed for ${doc.fileName}: ${attErr.message}`);
+            doc.sapUploaded = false;
+            doc.sapUploadStatus = 'FAILED';
+            doc.sapUploadError = attErr.message || 'SAP attachment upload failed';
+            failedAttachments.push({
+              docType: doc.docType,
+              fileName: doc.fileName,
+              error: doc.sapUploadError,
+              status: 'FAILED',
+            });
           }
         }
-        await reportStep('step6_attachments', 'COMPLETED');
+
+        const stepStatus = failedAttachments.length === 0 ? 'COMPLETED' : (uploadedAttachments.length > 0 ? 'PARTIAL' : 'FAILED');
+        await reportStep('step6_attachments', stepStatus, {
+          total: vendorData.documents.length,
+          uploadedCount: uploadedAttachments.length,
+          failedCount: failedAttachments.length,
+          uploadedAttachments,
+          failedAttachments,
+          documents: vendorData.documents,
+        });
       }
     } else {
       await reportStep('step6_attachments', 'SKIPPED');
@@ -838,6 +884,7 @@ const pushToS4HANA = async (vendorData, cfg, options = {}) => {
       bpNumber: bpNumber,
       payload: bpPayload,
       response: bpRes?.data,
+      documents: vendorData.documents,
     };
 
   } catch (err) {
@@ -933,6 +980,7 @@ const patchVendorInSAP = async (bpNumber, vendorData, addressId, cfg) => {
 
   if (targetAddressId) {
     const addrPatch = {
+      CareOfName:  generalData.tradeName  || '',
       StreetName:  generalData.street     || '',
       CityName:    generalData.city       || '',
       District:    generalData.district   || generalData.city || '', // Maps to CITY2 (District)
@@ -1547,10 +1595,12 @@ const pushVendorChangeRequest = async (bpNumber, proposedChanges, cfg) => {
       if (!matchedBank) {
         matchedBank = existingBanks.find(ex => ex.BankAccount === b.accountNumber);
       }
-      
+      // Note: bankName is kept strictly internal in VMM for approver reference and is NOT sent to SAP
+      const resolvedBankNumber = b.bankKey || (matchedBank ? matchedBank.BankNumber : (b.ifsc ? b.ifsc.substring(0, 4) : ''));
+
       const bankPayload = {
         BankCountryKey:        b.bankCountry || 'IN',
-        BankNumber:            b.bankKey || '',
+        BankNumber:            resolvedBankNumber,
         BankAccount:           b.accountNumber || '',
         BankAccountHolderName: b.accountHolder || '',
         BankControlKey:        b.controlKey || 'EN',
@@ -1591,6 +1641,9 @@ const pushVendorChangeRequest = async (bpNumber, proposedChanges, cfg) => {
       const addrId = addrObj.AddressID;
       const addrKey = `BusinessPartner='${formattedBp}',AddressID='${addrId}'`;
       const addrPayload = {};
+      if (addressDetails.tradeName || addressDetails.careOfName) {
+        addrPayload.CareOfName = addressDetails.tradeName || addressDetails.careOfName;
+      }
       if (addressDetails.street)      addrPayload.StreetName  = addressDetails.street;
       if (addressDetails.houseNumber) addrPayload.HouseNumber = addressDetails.houseNumber;
       if (addressDetails.city)         addrPayload.CityName    = addressDetails.city;
@@ -1653,6 +1706,9 @@ const checkDuplicateInSAP = async (cfg, vendorData) => {
 
   // Composite address
   const addressDetails = {};
+  if (vendorData.generalData?.tradeName || vendorData.addressDetails?.careOfName) {
+    addressDetails.CareOfName = vendorData.generalData?.tradeName || vendorData.addressDetails?.careOfName;
+  }
   if (vendorData.addressDetails?.houseNumber) addressDetails.HouseNumber = vendorData.addressDetails.houseNumber;
   if (vendorData.addressDetails?.street)      addressDetails.StreetName  = vendorData.addressDetails.street;
   if (vendorData.addressDetails?.city)        addressDetails.CityName    = vendorData.addressDetails.city;
@@ -1727,4 +1783,7 @@ module.exports = {
 
   // ── India Tax Sub-Bridge ──────────────────────────────────────────────
   sapIndiaTaxBridge,
+  uploadIndiaTaxAttachment: sapIndiaTaxBridge.uploadIndiaTaxAttachment,
+  getBPAttachments: sapIndiaTaxBridge.getBPAttachments,
+  downloadBPAttachmentStream: sapIndiaTaxBridge.downloadBPAttachmentStream,
 };

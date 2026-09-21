@@ -29,11 +29,21 @@ OcrUsageSchema.index({ tenantId: 1, date: 1 }, { unique: true });
  */
 OcrUsageSchema.statics.incrementCount = async function(tenantId, dateStr, modelName) {
   try {
-    const filter = { tenantId, date: dateStr };
-    const update = { $inc: { [`modelCounts.${modelName}`]: 1 } };
-    const options = { upsert: true, new: true, setDefaultsOnInsert: true };
-
-    return await this.findOneAndUpdate(filter, update, options);
+    let doc = await this.findOne({ tenantId, date: dateStr });
+    if (!doc) {
+      try {
+        doc = await this.create({ tenantId, date: dateStr, modelCounts: {} });
+      } catch (err) {
+        if (err.code === 11000) {
+          doc = await this.findOne({ tenantId, date: dateStr });
+        } else {
+          throw err;
+        }
+      }
+    }
+    const current = (doc.modelCounts && doc.modelCounts.get(modelName)) || 0;
+    doc.modelCounts.set(modelName, current + 1);
+    return await doc.save();
   } catch (err) {
     console.error(`[OcrUsage] Error incrementing count for model ${modelName}:`, err);
     return null;

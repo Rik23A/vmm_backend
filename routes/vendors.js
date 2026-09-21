@@ -14,29 +14,11 @@ const User = require('../models/User');
 const Tenant = require('../models/Tenant');
 const { injectTenant, getSapConfig } = require('../middleware/tenant');
 const { fetchVendorsFromSAP, patchVendorInSAP, getVendorFromSAP, pushVendor } = require('../utils/sapBridge');
-const { getIndiaTaxDetails } = require('../utils/sapIndiaTaxBridge');
+const { getIndiaTaxDetails, getBPAttachments, downloadBPAttachmentStream, uploadIndiaTaxAttachment } = require('../utils/sapIndiaTaxBridge');
 
-// ── Multer: Store uploads in /uploads/{tenantId}/ ─────────────────────
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '..', 'uploads', req.tenantId);
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${uuidv4()}${ext}`);
-  },
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: parseInt(process.env.UPLOAD_MAX_SIZE || '5242880') },
-  fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'image/jpeg', 'image/png'];
-    if (allowed.includes(file.mimetype)) return cb(null, true);
-    cb(new Error('Only PDF, JPG, and PNG files are allowed'));
-  },
-});
+// ── Multer: Secure external storage outside backend directory ─────────
+const { secureUpload, getSafeAbsolutePath } = require('../config/storage');
+const upload = secureUpload;
 
 // ── GET /api/vendors/config ───────────────────────────────────────────
 // Returns live dynamic settings from DB (bpGroupings, legalForms)
@@ -360,6 +342,7 @@ function mapSapToVmm(sapData) {
     const addrList = sapData.to_BusinessPartnerAddress?.results || (Array.isArray(sapData.to_BusinessPartnerAddress) ? sapData.to_BusinessPartnerAddress : (sapData.to_BusinessPartnerAddress ? [sapData.to_BusinessPartnerAddress] : []));
     const address = addrList[0];
     if (address) {
+      generalData.tradeName    = address.CareOfName         || sapData.OrganizationBPName3 || '';
       generalData.street       = [address.StreetPrefixName, address.StreetName, address.StreetSuffixName].filter(Boolean).join(' ');
       generalData.houseNumber  = address.HouseNumber        || '';
       generalData.building     = address.Building           || '';
@@ -473,7 +456,7 @@ function mapSapToVmm(sapData) {
       bankDetails.push({
         bankCountry:   b.BankCountryKey          || 'IN',
         bankKey:       b.BankNumber              || '',
-        ifsc:          b.BankAccountReferenceText || '',
+        ifsc:          b.ifsc || b.BankAccountReferenceText || (b.SWIFTCode && b.SWIFTCode.length === 11 ? b.SWIFTCode : '') || (b.BankNumber && b.BankNumber.length === 11 ? b.BankNumber : '') || b.SWIFTCode || '',
         bankName:      b.BankName               || '',
         accountNumber: b.BankAccount             || '',
         accountHolder: b.BankAccountHolderName   || b.AccountHolderName || '',
@@ -609,10 +592,11 @@ router.get('/sap/:sapVendorNumber', requireLogin, requireRole('REQUESTOR', 'L1_A
           bankDetails: [
             {
               bankCountry: 'IN',
-              bankKey: 'HDFC0001234',
+              bankKey: 'PNB',
+              ifsc: 'PUNB0123400',
               accountNumber: sapVendorNumber === 'V100001' ? '1234567890' : '9876543210',
               accountHolder: sapVendorNumber === 'V100001' ? 'STUB Vendor Alpha Pvt Ltd' : 'STUB Vendor Beta Corp',
-              bankName: 'HDFC Bank',
+              bankName: 'PUNJAB NATIONAL BANK',
               isPrimary: true,
             }
           ],
@@ -681,15 +665,167 @@ router.get('/sap/:sapVendorNumber', requireLogin, requireRole('REQUESTOR', 'L1_A
         const rawAtts = it.ToAttachments?.results || it.ToAttachments || [];
         if (Array.isArray(rawAtts) && rawAtts.length > 0) {
           mapped.taxDetails.sapAttachments = rawAtts.map(a => ({
-            attachmentId: a.AttachmentId,
-            fileName: a.FileName,
-            mimeType: a.MimeType,
-            createdOn: a.CreatedOn,
+            attachmentId: a.AttachmentId || a.attachmentId,
+            fileName: a.FileName || a.fileName,
+            fileExt: a.FileExt || a.fileExt,
+            mimeType: a.MimeType || a.mimeType,
+            mediaSrc: a.mediaSrc,
           }));
         }
       }
 
       res.json({ vendor: mapped });
+    } catch (err) { next(err); }
+  }
+);
+
+// ── GET /api/vendors/sap/:sapVendorNumber/attachments ──────────────────────
+// Returns live attachments directly from SAP ZBP_INDIA_SP_SRV/BPAttachmentSet
+router.get('/sap/:sapVendorNumber/attachments', requireLogin, requireRole('REQUESTOR', 'VENDOR', 'L1_APPROVER', 'L2_APPROVER', 'MASTER_DATA', 'ADMIN'),
+  injectTenant, async (req, res, next) => {
+    try {
+      const { sapVendorNumber } = req.params;
+
+      // Input validation
+      if (!/^[a-zA-Z0-9_-]+$/.test(sapVendorNumber)) {
+        return res.status(400).json({ message: 'Invalid vendor identifier parameter.' });
+      }
+
+      // RBAC Ownership check for Requestor & Vendor
+      if (req.user.role === 'REQUESTOR' || req.user.role === 'VENDOR') {
+        if (req.user.sapVendorNumber && req.user.sapVendorNumber !== sapVendorNumber) {
+          return res.status(403).json({ message: 'Access denied: You are not authorized to view attachments for this vendor.' });
+        }
+        if (!req.user.sapVendorNumber) {
+          const isOwner = await VendorRequest.exists({
+            tenantId: req.tenantId,
+            sapVendorNumber,
+            createdBy: req.user._id,
+          });
+          if (!isOwner) {
+            return res.status(403).json({ message: 'Access denied: You are not authorized to view attachments for this vendor.' });
+          }
+        }
+      } else if (req.user.role !== 'ADMIN' && req.user.role !== 'SUPER_ADMIN' && req.user.plants && req.user.plants.length > 0) {
+        // Approver plant scope check if vendor exists locally
+        const vendor = await VendorRequest.findOne({ tenantId: req.tenantId, sapVendorNumber }).select('plant');
+        if (vendor && vendor.plant && !req.user.plants.includes(vendor.plant)) {
+          return res.status(403).json({ message: 'Access denied: Vendor belongs to a plant outside your authorized scope.' });
+        }
+      }
+
+      const sapConfig = getSapConfig(req.tenant);
+      const attachments = await getBPAttachments(sapConfig, sapVendorNumber);
+      res.json({ attachments });
+    } catch (err) { next(err); }
+  }
+);
+
+// ── GET /api/vendors/sap/attachments/:attachmentId/stream ──────────────────
+// Proxies binary attachment stream directly from SAP BPAttachmentSet('<id>')/$value to browser
+// Security Measures:
+// 1. Validates JWT token from Bearer or ?token= query parameter.
+// 2. Strict alphanumeric regex on attachmentId to block OData injection / path traversal.
+// 3. Reverse Proxy: Keeps SAP host, port, and technical credentials completely hidden from client.
+// 4. Sets strict anti-sniffing, sandboxing (CSP), and private cache headers.
+router.get('/sap/attachments/:attachmentId/stream', requireLogin, injectTenant, async (req, res, next) => {
+  try {
+    const { attachmentId } = req.params;
+
+    // 1. Strict Input Sanitization (Prevents OData injection / Path Traversal)
+    if (!/^[a-zA-Z0-9_-]+$/.test(attachmentId)) {
+      return res.status(400).json({ message: 'Invalid attachment identifier parameter.' });
+    }
+
+    // 2. Ownership & RBAC checks
+    if (req.user.role === 'REQUESTOR' || req.user.role === 'VENDOR') {
+      const isAuthorized = await VendorRequest.exists({
+        tenantId: req.tenantId,
+        $or: [
+          { 'documents.sapAttachmentId': attachmentId, createdBy: req.user._id },
+          { 'documents.sapAttachmentId': attachmentId, ...(req.user.sapVendorNumber ? { sapVendorNumber: req.user.sapVendorNumber } : {}) },
+        ]
+      });
+
+      if (!isAuthorized && req.query.bpNumber) {
+        const bpNumber = String(req.query.bpNumber).trim();
+        const bpOwned = await VendorRequest.exists({
+          tenantId: req.tenantId,
+          sapVendorNumber: bpNumber,
+          $or: [
+            { createdBy: req.user._id },
+            ...(req.user.sapVendorNumber ? [{ sapVendorNumber: req.user.sapVendorNumber }] : [])
+          ]
+        });
+        if (!bpOwned) {
+          return res.status(403).json({ message: 'Access denied: You are not authorized to view this attachment.' });
+        }
+      }
+    } else if (req.user.role !== 'ADMIN' && req.user.role !== 'SUPER_ADMIN' && req.user.plants && req.user.plants.length > 0) {
+      // Approver plant scope check
+      const docRequest = await VendorRequest.findOne({
+        tenantId: req.tenantId,
+        'documents.sapAttachmentId': attachmentId,
+      }).select('plant');
+
+      if (docRequest && docRequest.plant && !req.user.plants.includes(docRequest.plant)) {
+        return res.status(403).json({ message: 'Access denied: Attachment belongs to a vendor outside your authorized plant scope.' });
+      }
+    }
+
+    const preferredFileName = req.query.fileName || req.query.fName || null;
+    const sapConfig = getSapConfig(req.tenant);
+    const streamRes = await downloadBPAttachmentStream(sapConfig, attachmentId, preferredFileName);
+
+    // 3. Security Response Headers
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "default-src 'none'");
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    res.setHeader('Content-Type', streamRes.contentType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', streamRes.contentDisposition || `inline; filename="${attachmentId}.pdf"`);
+    res.send(streamRes.data);
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/vendors/sap/:sapVendorNumber/attachments ─────────────────────
+// Uploads a document stream directly to SAP BPAttachmentSet with Slug: <BP>;<FileName>
+router.post('/sap/:sapVendorNumber/attachments', requireLogin, requireRole('L1_APPROVER', 'L2_APPROVER', 'MASTER_DATA', 'ADMIN'),
+  injectTenant, upload.any(), async (req, res, next) => {
+    try {
+      const { sapVendorNumber } = req.params;
+      const files = (req.files && req.files.length > 0) ? req.files : (req.file ? [req.file] : []);
+      if (files.length === 0) return res.status(400).json({ message: 'No file uploaded' });
+
+      const sapConfig = getSapConfig(req.tenant);
+      const results = [];
+
+      for (const f of files) {
+        const result = await uploadIndiaTaxAttachment(sapConfig, sapVendorNumber, {
+          filePath: f.path,
+          fileName: f.originalname,
+          mimeType: f.mimetype,
+        });
+        if (result) results.push(result);
+
+        await AuditLog.log({
+          tenantId: req.tenantId,
+          sapVendorNumber,
+          action: 'SAP_ATTACHMENT_UPLOADED',
+          performedBy: req.user._id,
+          performedByName: req.user.fullName,
+          performedByRole: req.user.role,
+          changes: [{ field: 'attachment', newValue: f.originalname, attachmentId: result?.attachmentId }],
+        });
+      }
+
+      res.status(201).json({
+        message: `${results.length} attachment(s) uploaded to SAP successfully`,
+        attachment: results[0],
+        attachments: results,
+      });
     } catch (err) { next(err); }
   }
 );
@@ -793,7 +929,8 @@ router.get('/:id', requireLogin, async (req, res, next) => {
   try {
     const vendor = await VendorRequest.findOne({ _id: req.params.id, tenantId: req.tenantId })
       .populate('createdBy', 'fullName email role')
-      .populate('approvalChain.performedBy', 'fullName email role');
+      .populate('approvalChain.performedBy', 'fullName email role')
+      .populate('sapResult.pushedBy', 'fullName email role');
     if (!vendor) return res.status(404).json({ message: 'Request not found' });
 
     if (req.user.role !== 'ADMIN' && req.user.plants && req.user.plants.length > 0) {
@@ -852,7 +989,7 @@ router.post('/:id/upload', requireLogin, requireRole('REQUESTOR', 'ADMIN'), inje
       if ((geminiConfig.enableOcrValidation || process.env.GEMINI_API_KEY) && ['GST_CERTIFICATE', 'PAN_CARD', 'CANCELLED_CHEQUE'].includes(req.body.docType)) {
         try {
           const ocrService = require('../utils/ocrService');
-          const fullPath = path.join(__dirname, '..', doc.filePath);
+          const fullPath = getSafeAbsolutePath(doc.filePath, req.tenantId);
           const ocrResult = await ocrService.validateDocument(fullPath, doc.docType, doc.mimeType, vendor, geminiConfig, req.tenantId);
           if (ocrResult) {
             doc.ocrResult = ocrResult;
@@ -889,14 +1026,73 @@ router.delete('/:id/documents/:docId', requireLogin, requireRole('REQUESTOR', 'A
 
     const doc = vendor.documents[docIdx];
     // Delete from disk
-    const filePath = path.join(__dirname, '..', doc.filePath);
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    const filePath = getSafeAbsolutePath(doc.filePath, req.tenantId);
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
     vendor.documents.splice(docIdx, 1);
     await vendor.save();
     res.json({ message: 'Document deleted' });
   } catch (err) { next(err); }
 });
+
+// ── POST /api/vendors/:id/documents/:docId/retry-sap-upload ────────────────
+// Retries uploading a specific document to SAP BPAttachmentSet if it previously failed
+router.post('/:id/documents/:docId/retry-sap-upload', requireLogin,
+  requireRole('L1_APPROVER', 'L2_APPROVER', 'MASTER_DATA', 'ADMIN'), injectTenant, async (req, res, next) => {
+    try {
+      const vendor = await VendorRequest.findOne({ _id: req.params.id, tenantId: req.tenantId });
+      if (!vendor) return res.status(404).json({ message: 'Request not found' });
+      if (!vendor.sapVendorNumber) {
+        return res.status(400).json({ message: 'Vendor does not have an SAP Vendor Number yet.' });
+      }
+
+      const doc = vendor.documents.id(req.params.docId) || vendor.documents.find(d => String(d._id) === req.params.docId);
+      if (!doc) return res.status(404).json({ message: 'Document not found' });
+
+      const sapConfig = getSapConfig(req.tenant);
+      const attRes = await uploadIndiaTaxAttachment(sapConfig, vendor.sapVendorNumber, doc);
+
+      if (attRes) {
+        doc.sapAttachmentId = attRes.attachmentId || attRes.AttachmentId;
+        doc.sapUploaded = true;
+        doc.sapUploadStatus = 'UPLOADED';
+        doc.sapUploadedAt = new Date();
+        doc.sapUploadError = null;
+        await vendor.save();
+
+        await AuditLog.log({
+          tenantId: req.tenantId,
+          requestId: vendor._id,
+          sapVendorNumber: vendor.sapVendorNumber,
+          action: 'SAP_ATTACHMENT_RETRY_SUCCESS',
+          performedBy: req.user._id,
+          performedByName: req.user.fullName,
+          changes: [{ field: 'attachment', newValue: doc.fileName, attachmentId: doc.sapAttachmentId }],
+        });
+
+        return res.json({ message: `'${doc.fileName}' uploaded to SAP successfully!`, document: doc });
+      } else {
+        doc.sapUploaded = false;
+        doc.sapUploadStatus = 'FAILED';
+        doc.sapUploadError = 'File missing from storage or empty file buffer';
+        await vendor.save();
+        return res.status(400).json({ message: doc.sapUploadError });
+      }
+    } catch (err) {
+      try {
+        const vendor = await VendorRequest.findOne({ _id: req.params.id, tenantId: req.tenantId });
+        const doc = vendor?.documents.id(req.params.docId) || vendor?.documents.find(d => String(d._id) === req.params.docId);
+        if (doc) {
+          doc.sapUploaded = false;
+          doc.sapUploadStatus = 'FAILED';
+          doc.sapUploadError = err.message || 'Retry failed';
+          await vendor.save();
+        }
+      } catch (_) {}
+      next(err);
+    }
+  }
+);
 
 
 
@@ -1078,6 +1274,7 @@ router.post('/sap-invitation-tokens', requireLogin, injectTenant, async (req, re
           sapVendorNumber: v.sapVendorNumber,
           email: v.email,
           vendorName: v.name || v.vendorName,
+          tradeName: v.tradeName || v.careOfName || '',
           vendorGroup: v.vendorGroup || 'UNKNOWN',
           companyCode: v.companyCode || '',
           token,
@@ -1174,6 +1371,7 @@ router.post('/bulk-invite', requireLogin, requireRole('ADMIN', 'MASTER_DATA'), i
             sapVendorNumber,
             email,
             vendorName,
+            tradeName: v.tradeName || v.careOfName || '',
             vendorGroup,
             companyCode: v.companyCode || companyCode || '',
             token,
@@ -1274,6 +1472,9 @@ router.patch('/:id/fix-and-resume-sap', requireLogin, requireRole('MASTER_DATA',
         });
 
         vendor.sapVendorNumber = result.vendorNumber;
+        if (Array.isArray(result.documents) && result.documents.length > 0) {
+          vendor.documents = result.documents;
+        }
         vendor.status = 'SAP_PUSHED';
         vendor.currentLevel = 'DONE';
         vendor.sapResult = {
@@ -1302,6 +1503,38 @@ router.patch('/:id/fix-and-resume-sap', requireLogin, requireRole('MASTER_DATA',
           sapPayload: result.payload,
           sapResponse: result.response,
         });
+
+        // ── Notify requestor, L1 creator approver, and MDT team
+        const queryMdtUsers = { tenantId: req.tenantId, role: 'MASTER_DATA', isActive: true };
+        if (vendor.plant) queryMdtUsers.plants = vendor.plant;
+        const mdtUsers = await User.find(queryMdtUsers).select('email');
+        const requestor = vendor.createdBy ? await User.findById(vendor.createdBy) : null;
+
+        const recipientEmails = new Set();
+        mdtUsers.forEach(u => { if (u.email) recipientEmails.add(u.email); });
+        if (requestor && requestor.email) {
+          recipientEmails.add(requestor.email);
+          if (requestor.createdBy) {
+            const creatorUser = await User.findById(requestor.createdBy);
+            if (creatorUser && creatorUser.email && (creatorUser.role === 'L1_APPROVER' || creatorUser.role === 'ADMIN')) {
+              recipientEmails.add(creatorUser.email);
+            }
+          }
+        }
+        if (vendor.approvalChain && vendor.approvalChain.length > 0) {
+          for (const entry of vendor.approvalChain) {
+            if (entry.performedBy) {
+              const approverUser = await User.findById(entry.performedBy);
+              if (approverUser && approverUser.email && approverUser.role === 'L1_APPROVER') {
+                recipientEmails.add(approverUser.email);
+              }
+            }
+          }
+        }
+
+        recipientEmails.forEach(email =>
+          sendEmail({ to: email, templateName: 'SAP_PUSHED', templateData: { request: vendor }, replyTo: req.user.email })
+        );
 
         return res.json({
           message: 'Vendor sync resumed and completed successfully in SAP',

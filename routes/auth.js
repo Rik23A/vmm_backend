@@ -241,6 +241,7 @@ router.get('/invitation/:token', async (req, res, next) => {
     res.json({
       message: 'Token is valid',
       vendorName: invitation.vendorName,
+      tradeName: invitation.tradeName || '',
       email: invitation.email,
       sapVendorNumber: invitation.sapVendorNumber,
       tenantId: invitation.tenantId
