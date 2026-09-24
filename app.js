@@ -92,8 +92,9 @@ app.use('/api/vendors',         require('./routes/vendors'));
 app.use('/api/change-requests', require('./routes/changeRequests'));
 app.use('/api/approvals',       require('./routes/approvals'));
 app.use('/api/admin',           require('./routes/admin'));
-app.use('/api/reports',         require('./routes/reports'));
-app.use('/api/notifications',   require('./routes/notifications'));
+app.use('/api/reports',               require('./routes/reports'));
+app.use('/api/notifications',         require('./routes/notifications'));
+app.use('/api/balance-confirmations', require('./routes/balanceConfirmations'));
 
 // ── Trust Reverse Proxy (Render / Heroku / AWS ALB) ─────────────────
 app.set('trust proxy', 1);

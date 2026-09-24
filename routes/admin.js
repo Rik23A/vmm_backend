@@ -194,9 +194,15 @@ router.put('/settings', requireLogin, requireRole('ADMIN'), async (req, res, nex
     const tenant = await Tenant.findOne({ tenantId: req.tenantId }).select('+sapConfig.sapPassword +emailConfig.emailPass +geminiConfig.geminiApiKey');
     if (!tenant) return res.status(404).json({ message: 'Tenant not found' });
     const changes = [];
-    ['sapConfig', 'emailConfig', 'workflowConfig', 'geminiConfig', 'companyName', 'plants'].forEach(field => {
+    const allowedFields = [
+      'sapConfig', 'emailConfig', 'workflowConfig', 'geminiConfig',
+      'companyName', 'regdOfficeAddress', 'cin', 'phone', 'fax', 'website',
+      'companyEntities', 'plants', 'balanceConfirmationConfig', 'modules'
+    ];
+    allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
-        if (typeof req.body[field] === 'object' && !Array.isArray(req.body[field])) {
+        if (typeof req.body[field] === 'object' && !Array.isArray(req.body[field]) && req.body[field] !== null) {
+          if (!tenant[field]) tenant[field] = {};
           Object.keys(req.body[field]).forEach(k => {
             if (['sapPassword', 'emailPass', 'geminiApiKey'].includes(k)) {
               // Only update password/API key if a new one is provided (not empty and not masked placeholder)
@@ -235,6 +241,9 @@ router.put('/settings', requireLogin, requireRole('ADMIN'), async (req, res, nex
     tenant.markModified('workflowConfig');
     tenant.markModified('geminiConfig');
     tenant.markModified('plants');
+    tenant.markModified('companyEntities');
+    tenant.markModified('balanceConfirmationConfig');
+    tenant.markModified('modules');
     await tenant.save();
     await AuditLog.log({ tenantId: req.tenantId, action: 'TENANT_SETTINGS_CHANGED',
       performedBy: req.user._id, performedByName: req.user.fullName, changes });

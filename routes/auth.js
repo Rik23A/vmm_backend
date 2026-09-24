@@ -144,10 +144,21 @@ router.post('/login', [
     });
 
     const token = signToken(user);
+    const { getEffectiveModules } = require('../utils/moduleHelper');
     res.json({
       token,
       user: user.toJSON(),
-      tenant: { companyName: tenant.companyName, plan: tenant.subscription.plan, plants: tenant.plants || [] },
+      tenant: {
+        companyName: tenant.companyName,
+        plan: tenant.subscription.plan,
+        plants: tenant.plants || [],
+        modules: getEffectiveModules(tenant),
+        balanceConfirmationConfig: tenant.balanceConfirmationConfig || null,
+        sapConfig: {
+          companyCodes: tenant.sapConfig?.companyCodes || [],
+          sapVersion: tenant.sapConfig?.sapVersion || 'STUB',
+        },
+      },
     });
   } catch (err) {
     next(err);
@@ -157,6 +168,7 @@ router.post('/login', [
 // ── GET /api/auth/me ──────────────────────────────────────────────────
 router.get('/me', requireLogin, async (req, res) => {
   const tenant = await Tenant.findOne({ tenantId: req.tenantId });
+  const { getEffectiveModules } = require('../utils/moduleHelper');
   res.json({
     user: req.user,
     tenant: tenant ? {
@@ -165,6 +177,12 @@ router.get('/me', requireLogin, async (req, res) => {
       status: tenant.subscription.status,
       sapVersion: tenant.sapConfig?.sapVersion,
       plants: tenant.plants || [],
+      modules: getEffectiveModules(tenant),
+      balanceConfirmationConfig: tenant.balanceConfirmationConfig || null,
+      sapConfig: {
+        companyCodes: tenant.sapConfig?.companyCodes || [],
+        sapVersion: tenant.sapConfig?.sapVersion || 'STUB',
+      },
     } : null,
   });
 });

@@ -67,7 +67,7 @@ router.patch('/tenants/:id', requireSuperAdminLogin, async (req, res, next) => {
     const tenant = await Tenant.findById(req.params.id);
     if (!tenant) return res.status(404).json({ message: 'Tenant not found.' });
 
-    const { isActive, subscription } = req.body;
+    const { isActive, subscription, modules } = req.body;
 
     if (isActive !== undefined) {
       tenant.isActive = isActive;
@@ -77,6 +77,13 @@ router.patch('/tenants/:id', requireSuperAdminLogin, async (req, res, next) => {
       if (subscription.status) tenant.subscription.status = subscription.status;
       if (subscription.trialEndsAt !== undefined) tenant.subscription.trialEndsAt = subscription.trialEndsAt;
       if (subscription.paidUntil !== undefined) tenant.subscription.paidUntil = subscription.paidUntil;
+    }
+    if (modules && typeof modules === 'object') {
+      if (!tenant.modules) tenant.modules = {};
+      if (modules.vendorMaster !== undefined) tenant.modules.vendorMaster = Boolean(modules.vendorMaster);
+      if (modules.balanceConfirmation !== undefined) tenant.modules.balanceConfirmation = Boolean(modules.balanceConfirmation);
+      if (modules.customerMaster !== undefined) tenant.modules.customerMaster = Boolean(modules.customerMaster);
+      tenant.markModified('modules');
     }
 
     await tenant.save();

@@ -1154,74 +1154,88 @@ const fetchVendorsFromSAP = async (cfg, opts = {}) => {
   let totalCount = 0;
 
   if (companyCode) {
-    // 1. Fetch all matching supplier IDs for the company code and range from A_SupplierCompany.
-    // We select only 'Supplier' to keep the response small and query fast.
-    const compParams = {
-      $select: 'Supplier',
-      $top:    '100000', // high limit to get all in the range
-      $format: 'json',
-    };
-    const compFilters = [`CompanyCode eq '${companyCode}'`];
-    if (fromVendor) compFilters.push(`Supplier ge '${fromVendor}'`);
-    if (toVendor)   compFilters.push(`Supplier le '${toVendor}'`);
-    compParams.$filter = compFilters.join(' and ');
+    if (search || vendorGroup) {
+      // Query A_Supplier with search/group filter first
+      const params = {
+        $select:      'Supplier,SupplierName,SupplierAccountGroup',
+        $top:         '1000',
+        $format:      'json',
+      };
+      const filters = [];
+      if (vendorGroup) filters.push(`SupplierAccountGroup eq '${vendorGroup}'`);
+      if (fromVendor) filters.push(`Supplier ge '${fromVendor}'`);
+      if (toVendor)   filters.push(`Supplier le '${toVendor}'`);
+      if (search) {
+        filters.push(`(substringof('${search}',Supplier) or substringof('${search}',SupplierName))`);
+      }
+      if (filters.length > 0) params.$filter = filters.join(' and ');
 
-    const compQs = new URLSearchParams(compParams);
-    const compRes = await sapODataRead(cfg, `/A_SupplierCompany?${compQs}`);
-    const compResults = compRes.data?.d?.results || compRes.data?.results || [];
-    if (compResults.length === 0) {
-      return { vendors: [], total: 0 };
-    }
+      const qs = new URLSearchParams(params);
+      const res = await sapODataRead(cfg, `/A_Supplier?${qs}`);
+      const rawCandidates = res.data?.d?.results || res.data?.results || [];
 
-    const companySupplierSet = new Set(compResults.map(c => c.Supplier));
+      if (rawCandidates.length === 0) {
+        return { vendors: [], total: 0 };
+      }
 
-    // 2. Query A_Supplier filtering by vendorGroup, range, and search term.
-    // Fetch a slightly larger batch (top * 2) to ensure we satisfy page size after filtering.
-    const queryTop = parseInt(top);
-    const querySkip = parseInt(skip);
-    const fetchLimit = queryTop > 1000 ? queryTop : queryTop * 2;
+      // Check which candidates belong to this companyCode in A_SupplierCompany
+      const candIds = rawCandidates.map(c => c.Supplier);
+      const chunkSize = 100;
+      const matchedSuppliers = new Set();
 
-    const params = {
-      $select:      'Supplier,SupplierName,SupplierAccountGroup',
-      $top:         String(fetchLimit),
-      $skip:        String(querySkip),
-      $inlinecount: 'allpages',
-      $format:      'json',
-    };
+      for (let i = 0; i < candIds.length; i += chunkSize) {
+        const chunk = candIds.slice(i, i + chunkSize);
+        const chunkFilter = chunk.map(id => `Supplier eq '${id}'`).join(' or ');
+        const compFilter = `CompanyCode eq '${companyCode}' and (${chunkFilter})`;
+        const compRes = await sapODataRead(cfg, `/A_SupplierCompany?$filter=(${encodeURIComponent(compFilter)})&$select=Supplier,CompanyCode&$format=json`);
+        const compRows = compRes.data?.d?.results || compRes.data?.results || [];
+        compRows.forEach(r => matchedSuppliers.add(r.Supplier));
+      }
 
-    const filters = [];
-    if (vendorGroup) {
-      filters.push(`SupplierAccountGroup eq '${vendorGroup}'`);
-    }
-    if (fromVendor) {
-      filters.push(`Supplier ge '${fromVendor}'`);
-    }
-    if (toVendor) {
-      filters.push(`Supplier le '${toVendor}'`);
-    }
-    if (search) {
-      filters.push(`(substringof('${search}',Supplier) or substringof('${search}',SupplierName))`);
-    }
-    if (filters.length > 0) {
-      params.$filter = filters.join(' and ');
-    }
-
-    const qs = new URLSearchParams(params);
-    const res = await sapODataRead(cfg, `/A_Supplier?${qs}`);
-    const rawBpResults = res.data?.d?.results || res.data?.results || [];
-    const rawTotalCount = res.data?.d?.__count || res.data?.__count || rawBpResults.length;
-
-    // Filter against company suppliers set
-    const filteredBpResults = rawBpResults.filter(bp => companySupplierSet.has(bp.Supplier));
-    
-    bpResults = filteredBpResults.slice(0, queryTop);
-    
-    // Estimate total count based on how many matched
-    if (rawBpResults.length > 0) {
-      const matchRatio = filteredBpResults.length / rawBpResults.length;
-      totalCount = Math.round(parseInt(rawTotalCount) * matchRatio);
+      const matchingList = rawCandidates.filter(c => matchedSuppliers.has(c.Supplier));
+      totalCount = matchingList.length;
+      bpResults = matchingList.slice(parseInt(skip), parseInt(skip) + parseInt(top)).map(m => ({
+        ...m,
+        CompanyCode: companyCode,
+      }));
     } else {
-      totalCount = 0;
+      // Pure CompanyCode browsing with high-performance native SAP paging
+      const compParams = {
+        $select: 'Supplier,CompanyCode',
+        $top: String(top),
+        $skip: String(skip),
+        $inlinecount: 'allpages',
+        $format: 'json',
+      };
+      const compFilters = [`CompanyCode eq '${companyCode}'`];
+      if (fromVendor) compFilters.push(`Supplier ge '${fromVendor}'`);
+      if (toVendor)   compFilters.push(`Supplier le '${toVendor}'`);
+      compParams.$filter = compFilters.join(' and ');
+
+      const compQs = new URLSearchParams(compParams);
+      const compRes = await sapODataRead(cfg, `/A_SupplierCompany?${compQs}`);
+      const compResults = compRes.data?.d?.results || compRes.data?.results || [];
+      totalCount = parseInt(compRes.data?.d?.__count || compRes.data?.__count || compResults.length, 10);
+
+      if (compResults.length === 0) {
+        return { vendors: [], total: 0 };
+      }
+
+      const pageSupIds = compResults.map(c => c.Supplier);
+      const supFilter = pageSupIds.map(id => `Supplier eq '${id}'`).join(' or ');
+      const supRes = await sapODataRead(cfg, `/A_Supplier?$filter=(${encodeURIComponent(supFilter)})&$select=Supplier,SupplierName,SupplierAccountGroup&$format=json`);
+      const supDetails = supRes.data?.d?.results || supRes.data?.results || [];
+      const supMap = new Map(supDetails.map(s => [s.Supplier, s]));
+
+      bpResults = compResults.map(c => {
+        const s = supMap.get(c.Supplier) || {};
+        return {
+          Supplier: c.Supplier,
+          SupplierName: s.SupplierName || c.Supplier,
+          SupplierAccountGroup: s.SupplierAccountGroup || '',
+          CompanyCode: c.CompanyCode,
+        };
+      });
     }
   } else {
     const params = {
@@ -1252,19 +1266,37 @@ const fetchVendorsFromSAP = async (cfg, opts = {}) => {
     const qs = new URLSearchParams(params);
     const res = await sapODataRead(cfg, `/A_Supplier?${qs}`);
     bpResults = res.data?.d?.results || res.data?.results || [];
-    totalCount = res.data?.d?.__count || res.data?.__count || bpResults.length;
+    totalCount = parseInt(res.data?.d?.__count || res.data?.__count || bpResults.length, 10);
   }
 
   if (bpResults.length === 0) {
     return { vendors: [], total: 0 };
   }
 
-  // Step 2: Fetch default email addresses for the retrieved Suppliers in separate light chunked queries to avoid 414 Request-URI Too Long errors
+  // Step 2: Fetch default email addresses and company codes for the retrieved Suppliers
   const bpNumbers = bpResults.map(bp => bp.Supplier);
   const emailMap = {};
+  const companyCodeMap = {};
 
+  // Step 2A: If companyCode was NOT explicitly filtered, resolve company codes for this page of vendors
+  if (!companyCode && bpNumbers.length > 0) {
+    try {
+      const supFilter = bpNumbers.map(num => `Supplier eq '${num}'`).join(' or ');
+      const compRes = await sapODataRead(cfg, `/A_SupplierCompany?$filter=(${encodeURIComponent(supFilter)})&$select=Supplier,CompanyCode&$format=json`);
+      const compResults = compRes.data?.d?.results || compRes.data?.results || [];
+      compResults.forEach(r => {
+        if (!companyCodeMap[r.Supplier]) companyCodeMap[r.Supplier] = [];
+        if (!companyCodeMap[r.Supplier].includes(r.CompanyCode)) {
+          companyCodeMap[r.Supplier].push(r.CompanyCode);
+        }
+      });
+    } catch (ccErr) {
+      console.warn('⚠️ [sapBridge] Failed to resolve company codes:', ccErr.message);
+    }
+  }
+
+  // Step 2B: Fetch email addresses
   try {
-    // Chunk size of 100 to keep the filter query length safe
     const chunkSize = 100;
     const chunks = [];
     for (let i = 0; i < bpNumbers.length; i += chunkSize) {
@@ -1296,13 +1328,19 @@ const fetchVendorsFromSAP = async (cfg, opts = {}) => {
     console.warn(`⚠️ [sapBridge] Failed to resolve emails in step 2:`, err.message);
   }
 
-  const results = bpResults.map(item => ({
-    BusinessPartner:        item.Supplier            || '',
-    BusinessPartnerFullName: item.SupplierName       || item.Supplier || '',
-    email:                  emailMap[item.Supplier]  || '',
-    SearchTerm1:            '',
-    Language:               'EN',
-  }));
+  const results = bpResults.map(item => {
+    const assignedCcs = companyCode ? [companyCode] : (companyCodeMap[item.Supplier] || (item.CompanyCode ? [item.CompanyCode] : []));
+    return {
+      BusinessPartner:        item.Supplier            || '',
+      BusinessPartnerFullName: item.SupplierName       || item.Supplier || '',
+      email:                  emailMap[item.Supplier]  || '',
+      companyCode:            assignedCcs[0]           || companyCode || '',
+      companyCodes:           assignedCcs,
+      vendorGroup:            item.SupplierAccountGroup || '',
+      SearchTerm1:            '',
+      Language:               'EN',
+    };
+  });
 
   return {
     vendors: results,

@@ -16,6 +16,49 @@ const TenantSchema = new mongoose.Schema({
     trim: true,
   },
 
+  regdOfficeAddress: {
+    type: String,
+    default: '',
+  },
+
+  cin: {
+    type: String,
+    default: '',
+  },
+
+  phone: {
+    type: String,
+    default: '',
+  },
+
+  fax: {
+    type: String,
+    default: '',
+  },
+
+  website: {
+    type: String,
+    default: '',
+  },
+
+  // ── Multi-Entity / Company Codes Configuration ──────────────────────
+  // Allows supporting multiple legal company entities under one tenant
+  companyEntities: {
+    type: [{
+      companyCode: { type: String, required: true },
+      legalName: { type: String, required: true },
+      cin: { type: String, default: '' },
+      gstin: { type: String, default: '' },
+      pan: { type: String, default: '' },
+      regdOfficeAddress: { type: String, default: '' },
+      phone: { type: String, default: '' },
+      fax: { type: String, default: '' },
+      website: { type: String, default: '' },
+      logoUrl: { type: String, default: '' },
+    }],
+    default: [],
+  },
+
   subdomain: {
     type: String,
     unique: true,
@@ -93,6 +136,33 @@ const TenantSchema = new mongoose.Schema({
     paidUntil: { type: Date, default: null },
   },
 
+  // ── Modular Entitlements (Add-on modules enabled per company)
+  modules: {
+    vendorMaster: { type: Boolean, default: true },
+    balanceConfirmation: { type: Boolean, default: false },
+    customerMaster: { type: Boolean, default: false },
+  },
+
+  // ── Vendor Balance Confirmation (SA 505) Configuration
+  balanceConfirmationConfig: {
+    defaultAuditorGroupEmail: { type: String, default: '' },
+    defaultClientApEmail: { type: String, default: '' },
+    defaultResponseDeadlineDays: { type: Number, default: 10 },
+    disclaimerClause: {
+      type: String,
+      default: 'This balance confirmation is requested in accordance with Standard on Auditing (SA) 505 issued by the Institute of Chartered Accountants of India (ICAI).'
+    },
+    auditorFirmName: { type: String, default: '' },
+    auditorAddress: { type: String, default: '' },
+    auditorEmails: [{ type: String }],
+    auditors: [{
+      auditorFirmName: { type: String, required: true },
+      address: { type: String, default: '' },
+      emails: [{ type: String }],
+      activeForFiscalYears: [{ type: String }],
+    }],
+  },
+
   // ── Workflow configuration
   workflowConfig: {
     requireL2Approval: { type: Boolean, default: true },   // can skip L2 for some tenants
@@ -114,7 +184,12 @@ const TenantSchema = new mongoose.Schema({
   plants: {
     type: [{
       code: { type: String, required: true },
-      name: { type: String, required: true }
+      name: { type: String, required: true },
+      companyCode: { type: String, default: '' },
+      division: { type: String, default: '' },
+      address: { type: String, default: '' },
+      apEmail: { type: String, default: '' },
+      signatoryTitle: { type: String, default: 'Authorized Signatory' },
     }],
     default: []
   },

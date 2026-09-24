@@ -47,7 +47,7 @@ const getSapConfig = (tenant) => {
     sapSystemId: tc.sapSystemId || process.env.SAP_SYSTEM_ID || '',
     sapUser: tc.sapUser || process.env.SAP_USER || '',
     sapPassword: tc.sapPassword || process.env.SAP_PASSWORD || '',
-    sapOdataUrl: tc.sapOdataUrl || process.env.SAP_ODATA_URL || '',
+    sapOdataUrl: tc.sapOdataUrl || (process.env.SAP_ODATA_URL && !process.env.SAP_ODATA_URL.includes('your-s4hana.com') ? process.env.SAP_ODATA_URL : '') || '',
     sapIndiaTaxOdataUrl: tc.sapIndiaTaxOdataUrl || process.env.SAP_INDIA_TAX_ODATA_URL || '',
     companyCodes: tc.companyCodes || [],
     purchasingOrgs: tc.purchasingOrgs || [],

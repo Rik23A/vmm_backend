@@ -26,9 +26,13 @@ router.get('/config', requireLogin, injectTenant, async (req, res, next) => {
   try {
     const tenant = await Tenant.findOne({ tenantId: req.tenantId });
     if (!tenant) return res.status(404).json({ message: 'Tenant not found' });
+    const configuredCompanyCodes = (tenant.sapConfig?.companyCodes && tenant.sapConfig.companyCodes.length > 0)
+      ? tenant.sapConfig.companyCodes
+      : ['1000', '2000', '3000', '5000', '6000'];
     res.json({
       bpGroupings: tenant.sapConfig?.bpGroupings || [],
       legalForms: tenant.sapConfig?.legalForms || [],
+      companyCodes: configuredCompanyCodes,
     });
   } catch (err) { next(err); }
 });
